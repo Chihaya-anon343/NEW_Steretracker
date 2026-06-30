@@ -13,7 +13,7 @@
  *             right ray: origin=t_rl,     direction=R_rl·(K⁻¹·(uR,vR,1) normalized)
  *
  *           Residual: cross(R·pt_3d + t - origin, direction) → 3 values per ray
- *           Total residuals: 6 × n_pts for 7 parameters [qx,qy,qz,qw,tx,ty,tz]
+ *           Total residuals: 6 × n_pts for 7 parameters [qw,qx,qy,qz,tx,ty,tz]
  *
  *           Optimized via Eigen::Levenberg-Marquardt (replaces scipy.optimize.least_squares).
  *

@@ -146,18 +146,12 @@ int main(int argc, char** argv) {
                 auto ext = createFeatureExtractor(
                     roi_area, scale, tracker_cfg.lk_params,
                     binary_template_dir, binary_cfg, tiny_cfg);
-                // AKAZE 需额外初始化相机和模板
-                if (auto* akaze = dynamic_cast<AkazeGpnpExtractor*>(ext.get())) {
-                    akaze->initCamera(tracker.cameraParams());
-                    akaze->setTemplateData(template_path, tw, th);
-                }
+                // AKAZE 初始化（相机 + 模板缓存）已由 setExtractor() 内部处理
                 tracker.setExtractor(std::move(ext));
             } else {
                 // 无检测结果 → 默认 AKAZE
                 auto akaze = std::make_unique<AkazeGpnpExtractor>(
                     scale, tracker_cfg.lk_params);
-                akaze->initCamera(tracker.cameraParams());
-                akaze->setTemplateData(template_path, tw, th);
                 tracker.setExtractor(std::move(akaze));
             }
 

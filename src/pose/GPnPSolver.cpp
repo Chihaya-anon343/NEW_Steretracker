@@ -29,19 +29,22 @@ struct GPNPCostFunctor {
     const Eigen::MatrixX3d& origins_R;  // N×3
     const Eigen::MatrixX3d& dirs_R;     // N×3
     const int n_pts;
+    const Eigen::Vector3d t_warm;       // warm-start translation (prior anchor)
 
     GPNPCostFunctor(const Eigen::MatrixX3d& _pts_3d_T,
                     const Eigen::MatrixX3d& _origins_L,
                     const Eigen::MatrixX3d& _dirs_L,
                     const Eigen::MatrixX3d& _origins_R,
                     const Eigen::MatrixX3d& _dirs_R,
-                    int _n_pts)
+                    int _n_pts,
+                    const Eigen::Vector3d& _t_warm = Eigen::Vector3d::Zero())
         : pts_3d_T(_pts_3d_T), origins_L(_origins_L), dirs_L(_dirs_L),
-          origins_R(_origins_R), dirs_R(_dirs_R), n_pts(_n_pts)
+          origins_R(_origins_R), dirs_R(_dirs_R), n_pts(_n_pts),
+          t_warm(_t_warm)
     {}
 
     int inputs() const { return 7; }
-    int values() const { return 6 * n_pts; }
+    int values() const { return 6 * n_pts + 3; }  // +3 for translation prior (tx,ty,tz)
 
     /// Numerical Jacobian via central differences.
     int df(const InputType& x, JacobianType& fjac) const {
@@ -62,43 +65,35 @@ struct GPNPCostFunctor {
 
     /// Compute residuals: direct quaternion→R, vectorized cross products, interleaved output.
     int operator()(const InputType& x, ValueType& fvec) const {
-        // Quaternion normalize (0626 convention: params = [w, x, y, z, tx, ty, tz])
+        // Quaternion→R (normalization-agnostic: divide by q² for smooth Jacobian)
+        // params = [w, x, y, z, tx, ty, tz]
         double qw = x(0), qx = x(1), qy = x(2), qz = x(3);
-        double qn = std::sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
-        if (qn < 1e-10) { fvec.setZero(); return 0; }
-        qw /= qn; qx /= qn; qy /= qn; qz /= qn;
-        if (qz < 0.0) { qw = -qw; qx = -qx; qy = -qy; qz = -qz; }
+        double qn2 = qw*qw + qx*qx + qy*qy + qz*qz;
+        if (qn2 < 1e-20) { fvec.setZero(); return 0; }
+        double inv_qn2 = 1.0 / qn2;
 
-        // Direct quaternion→R (0626 formula, no scipy.Rotation object overhead)
-        double qxx = qx*qx, qxy = qx*qy, qxz = qx*qz;
-        double qyy = qy*qy, qyz = qy*qz, qzz = qz*qz;
-        double qwx = qw*qx, qwy = qw*qy, qwz = qw*qz;
-
-        // R = [R00 R01 R02; R10 R11 R12; R20 R21 R22]
-        //   = 1-2(y²+z²)  2(xy-wz)   2(xz+wy)
-        //     2(xy+wz)     1-2(x²+z²) 2(yz-wx)
-        //     2(xz-wy)     2(yz+wx)   1-2(x²+y²)
-        // (With 0626 naming where qx=input_x, qy=input_y, qz=input_z, qw=input_w)
-        // Actually matching the 0626 code exactly:
-        double R00 = 1.0 - 2.0*(qyy + qzz);
-        double R01 = 2.0*(qxy - qwz);
-        double R02 = 2.0*(qxz + qwy);
-        double R10 = 2.0*(qxy + qwz);
-        double R11 = 1.0 - 2.0*(qxx + qzz);
-        double R12 = 2.0*(qyz - qwx);
-        double R20 = 2.0*(qxz - qwy);
-        double R21 = 2.0*(qyz + qwx);
-        double R22 = 1.0 - 2.0*(qxx + qyy);
+        // R = 1/q² * [q²-2(y²+z²)  2(xy-wz)     2(xz+wy) ]
+        //            [2(xy+wz)       q²-2(x²+z²)  2(yz-wx) ]
+        //            [2(xz-wy)       2(yz+wx)      q²-2(x²+y²)]
+        double R00 = (qn2 - 2.0*(qy*qy + qz*qz)) * inv_qn2;
+        double R01 = 2.0*(qx*qy - qw*qz) * inv_qn2;
+        double R02 = 2.0*(qx*qz + qw*qy) * inv_qn2;
+        double R10 = 2.0*(qx*qy + qw*qz) * inv_qn2;
+        double R11 = (qn2 - 2.0*(qx*qx + qz*qz)) * inv_qn2;
+        double R12 = 2.0*(qy*qz - qw*qx) * inv_qn2;
+        double R20 = 2.0*(qx*qz - qw*qy) * inv_qn2;
+        double R21 = 2.0*(qy*qz + qw*qx) * inv_qn2;
+        double R22 = (qn2 - 2.0*(qx*qx + qy*qy)) * inv_qn2;
 
         double tx = x(4), ty = x(5), tz = x(6);
 
         // Compute residuals per point (interleaved: cross_l[3] + cross_r[3])
         for (int i = 0; i < n_pts; ++i) {
             double px = pts_3d_T(i,0), py = pts_3d_T(i,1), pz = pts_3d_T(i,2);
-            // P_c1 = R * pt_3d + t
-            double Px = px*R00 + py*R10 + pz*R20 + tx;
-            double Py = px*R01 + py*R11 + pz*R21 + ty;
-            double Pz = px*R02 + py*R12 + pz*R22 + tz;
+            // P_cam = R * pt_3d + t  (standard row-access matrix-vector multiply)
+            double Px = px*R00 + py*R01 + pz*R02 + tx;
+            double Py = px*R10 + py*R11 + pz*R12 + ty;
+            double Pz = px*R20 + py*R21 + pz*R22 + tz;
 
             // Left cross
             double dLx = Px - origins_L(i,0), dLy = Py - origins_L(i,1), dLz = Pz - origins_L(i,2);
@@ -112,6 +107,19 @@ struct GPNPCostFunctor {
             fvec(6*i+4) = dRz*dirs_R(i,0) - dRx*dirs_R(i,2);
             fvec(6*i+5) = dRx*dirs_R(i,1) - dRy*dirs_R(i,0);
         }
+
+        // Translation prior: quadratic restoring force toward warm-start.
+        // Breaks coplanar PnP ambiguity — without this, (R, t) and (R', t')
+        // with very different t can give identical cross-product residuals
+        // for coplanar template points.
+        //   w_tz heavier: depth is most affected by coplanar ambiguity
+        //   w_t² adds to J^T*J diagonal → damps first LM step in t-direction
+        const double w_t = 0.5;
+        const double w_tz = 2.0;
+        fvec(6 * n_pts + 0) = w_t  * (tx - t_warm(0));
+        fvec(6 * n_pts + 1) = w_t  * (ty - t_warm(1));
+        fvec(6 * n_pts + 2) = w_tz * (tz - t_warm(2));
+
         return 0;
     }
 };
@@ -260,7 +268,8 @@ PoseEstimate GPnPSolver::solve(PipelineResult& result,
     // ---- Step 6: Initial parameter vector (0626: [w,x,y,z,tx,ty,tz]) ----
     Eigen::VectorXd x0(7);
     if (R_init != nullptr && t_init != nullptr) {
-        // scipy Rotation.as_quat() gives [x,y,z,w]; reorder to [w,x,y,z]
+        // Cost function uses standard R * p + t convention.
+        // R_init is already in R_physical convention; use it directly.
         Eigen::Quaterniond q_eigen(*R_init);
         x0 << q_eigen.w(), q_eigen.x(), q_eigen.y(), q_eigen.z(),
               (*t_init)(0), (*t_init)(1), (*t_init)(2);
@@ -269,7 +278,8 @@ PoseEstimate GPnPSolver::solve(PipelineResult& result,
     }
 
     // ---- Step 7: LM optimization ----
-    GPNPCostFunctor functor(pts_3d_arr, origins_L, dirs_L, origins_R, dirs_R, n_pts);
+    Eigen::Vector3d t_warm = (t_init != nullptr) ? *t_init : Eigen::Vector3d(0, 0, depth_guess);
+    GPNPCostFunctor functor(pts_3d_arr, origins_L, dirs_L, origins_R, dirs_R, n_pts, t_warm);
 
     Eigen::VectorXd fvec_init(functor.values());
     functor(x0, fvec_init);
@@ -304,10 +314,46 @@ PoseEstimate GPnPSolver::solve(PipelineResult& result,
     monitor_.opt_success = opt_success;
     monitor_.opt_message = opt_success ? "Converged" : "Failed";
 
+    // Cost function uses standard R * p + t convention.
+    // The optimized quaternion directly encodes R_physical.
     pose_result.R = q_opt_eigen.toRotationMatrix();
     pose_result.t = t_opt;
     pose_result.num_points = n_pts;
     pose_result.success = opt_success;
+
+    // Diagnostic: compare GPnP result with InitialPnP warm-start
+    if (R_init != nullptr && t_init != nullptr && opt_success) {
+        double t_dot = pose_result.t.dot(*t_init);
+        double R_diff = (pose_result.R - *R_init).norm();
+        std::cout << "  [GPnP Diag] t_warm=[" << (*t_init)(0) << "," << (*t_init)(1) << "," << (*t_init)(2) << "]"
+                  << "  t_opt=[" << pose_result.t(0) << "," << pose_result.t(1) << "," << pose_result.t(2) << "]"
+                  << "  t·t_warm=" << t_dot << "  |ΔR|=" << R_diff << std::endl;
+        if (t_dot < 0.0) {
+            std::cerr << "  [GPnP WARNING] Translation sign flipped! t·t_warm=" << t_dot << std::endl;
+        }
+
+        // Sanity checks for PnP warm-start results (not depth-guess).
+        // For coplanar templates, GPnP R may be corrupted by the r₃ ambiguity
+        // (unconstrained third column) while t is correctly refined by stereo.
+        bool from_pnp = (*R_init - Eigen::Matrix3d::Identity()).norm() > 0.01;
+        if (from_pnp) {
+            if (t_dot < 0.0) {
+                // Translation sign flipped → complete fallback to InitialPnP
+                std::cerr << "  [GPnP FALLBACK] Translation sign flipped (t·t_warm=" << t_dot
+                          << "), using InitialPnP pose" << std::endl;
+                pose_result.R = *R_init;
+                pose_result.t = *t_init;
+                pose_result.success = true;
+            } else if (R_diff > 1.5) {
+                // Large |ΔR| with correct t sign → coplanar r₃ ambiguity.
+                // Keep InitialPnP R (geometrically consistent), use GPnP t (stereo-refined).
+                std::cout << "  [GPnP HYBRID] |ΔR|=" << R_diff
+                          << " > 1.5 (coplanar ambiguity), using InitialPnP R + GPnP t" << std::endl;
+                pose_result.R = *R_init;
+                // pose_result.t = t_opt (already set from GPnP)
+            }
+        }
+    }
 
     auto t_end = std::chrono::high_resolution_clock::now();
     timing_ms_out = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -315,7 +361,8 @@ PoseEstimate GPnPSolver::solve(PipelineResult& result,
     result.timing["gpnp"] = timing_ms_out;
 
     if (!opt_success) {
-        monitor_.failure_reason = "Optimizer failed";
+        if (monitor_.failure_reason.empty())
+            monitor_.failure_reason = "Optimizer failed";
         printMonitor();
     }
     return pose_result;

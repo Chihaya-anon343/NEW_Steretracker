@@ -49,6 +49,9 @@ public:
                          double real_width_mm,
                          double real_height_mm) override;
 
+    /// Direct assignment of pre-extracted template data (no re-extraction).
+    void setTemplateData(const TemplateData& data) { template_ = data; }
+
     PipelineResult extract(const cv::Mat& left_gray,
                            const cv::Mat& right_gray,
                            const cv::Mat& left_color,

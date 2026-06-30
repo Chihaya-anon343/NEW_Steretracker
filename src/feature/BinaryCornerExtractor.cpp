@@ -156,10 +156,12 @@ PipelineResult BinaryCornerExtractor::extract(const cv::Mat& left_gray,
     const TemplateData* matched_tmpl = last_matched_template_;
     double matched_overlap = last_match_overlap_;
 
-    // ---- Step 3: Extract corners from right image ----
+    // ---- Step 3: Extract corners from right image (reuse left's template) ----
     std::vector<cv::Point2f> right_corners;
     if (has_right) {
-        Status s_right = extractFromBinary(right_binary, right_gray, right_corners);
+        // 右目复用左目的模板，避免独立 findBestMatch 导致左右匹配不同模板
+        Status s_right = extractFromBinary(right_binary, right_gray, right_corners,
+                                           matched_tmpl);
         if (s_right != Status::Success || right_corners.empty()) {
             std::cerr << "[BinaryCorner] Right extraction failed (status="
                       << static_cast<int>(s_right) << "), stereo disabled." << std::endl;
@@ -257,7 +259,10 @@ PipelineResult BinaryCornerExtractor::extract(const cv::Mat& left_gray,
               << " corners (L), " << right_corners.size() << " corners (R)"
               << ", stereo=" << n_stereo
               << ", angle=" << (matched_tmpl ? std::to_string(matched_tmpl->angle) : "none")
-              << ", overlap=" << matched_overlap << std::endl;
+              << ", overlap=" << matched_overlap
+              << ", template_corners=" << (matched_tmpl ? static_cast<int>(matched_tmpl->corners.size()) : 0)
+              << ", 3d_pts=" << template_data_.pts_3d.size()
+              << std::endl;
 
     return result;
 }
@@ -268,7 +273,8 @@ PipelineResult BinaryCornerExtractor::extract(const cv::Mat& left_gray,
 
 Status BinaryCornerExtractor::extractFromBinary(const cv::Mat& binary_img,
                                                  const cv::Mat& gray_roi,
-                                                 std::vector<cv::Point2f>& out_corners) {
+                                                 std::vector<cv::Point2f>& out_corners,
+                                                 const TemplateData* preset_template) {
     process_log_.clear();
     last_matched_template_ = nullptr;
     last_match_overlap_ = 0.0;
@@ -311,7 +317,14 @@ Status BinaryCornerExtractor::extractFromBinary(const cv::Mat& binary_img,
     cv::Mat smoothed = smoothBoundary(filled);
 
     // ---- Step 4: Template matching ----
-    if (!templates_.empty() && config_.target_size.width > 0) {
+    if (preset_template != nullptr) {
+        // 使用预设模板（来自另一目的匹配结果），跳过独立的 findBestMatch
+        last_matched_template_ = preset_template;
+        last_match_overlap_ = -1.0;  // 标记为非独立匹配
+        logStep("FindBestMatch",
+                "Preset: angle=" + std::to_string(preset_template->angle) +
+                " deg (reused from other eye)");
+    } else if (!templates_.empty() && config_.target_size.width > 0) {
         cv::Mat resized_binary;
         cv::resize(smoothed, resized_binary, config_.target_size, 0, 0, cv::INTER_NEAREST);
 
@@ -617,17 +630,38 @@ std::vector<cv::Point2f> BinaryCornerExtractor::extractCornersFromContour(
     // Epsilon binary search: larger epsilon → fewer corners
     double lo = 0.001, hi = 0.05;
     std::vector<cv::Point2f> approx;
+    std::vector<cv::Point2f> best_approx;   // 跟踪最接近目标角点数的近似结果
+    int best_diff = std::numeric_limits<int>::max();
+    bool exact_hit = false;
+
     for (int iter = 0; iter < 8; ++iter) {
         double mid = (lo + hi) / 2.0;
         cv::approxPolyDP(work_contour, approx, mid * perimeter, true);
         int n = static_cast<int>(approx.size());
+        int diff = std::abs(n - config_.corners);
+
+        // 跟踪最佳近似
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_approx = approx;
+        }
+
         if (n == config_.corners) {
+            exact_hit = true;
             break;
         } else if (n < config_.corners) {
             hi = mid;
         } else {
             lo = mid;
         }
+    }
+
+    // 如果未精确命中，使用最接近的一次近似结果
+    if (!exact_hit && !best_approx.empty()) {
+        std::cout << "[BinaryCorner] approxPolyDP binary search: no exact hit, "
+                  << "best=" << best_approx.size() << " corners (target="
+                  << config_.corners << ", diff=" << best_diff << ")" << std::endl;
+        approx = std::move(best_approx);
     }
 
     if (approx.empty()) {

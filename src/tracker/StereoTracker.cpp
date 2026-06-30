@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
 
 namespace gpnp {
 
@@ -225,11 +226,41 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
         Eigen::Vector3d t_id(0, 0, 5000);
         pose = gpnp_solver_.solve(result, pnp_pts_3d, &R_id, &t_id, gpnp_timing);
     } else if (is_first && !is_akaze) {
-        // Non-AKAZE first frame (BinaryCorner): skip InitialPnP, use identity warm-start
-        std::cout << "  [InitialPnP] Skipped (non-AKAZE strategy: " << extractor_->name() << ")" << std::endl;
-        Eigen::Matrix3d R_id = Eigen::Matrix3d::Identity();
-        Eigen::Vector3d t_id(0, 0, 5000);
-        pose = gpnp_solver_.solve(result, pnp_pts_3d, &R_id, &t_id, gpnp_timing);
+        // BinaryCorner first frame: try InitialPnP if enabled, fall back to depth guess
+        PoseEstimate init_pose;
+        bool use_init = false;
+        if (config_.use_initial_pnp) {
+            MatchResult match_res;
+            match_res.good_matches       = result.good_matches;
+            match_res.pts_left_match     = result.pts_left_match;
+            match_res.pts_template_match = result.pts_template_match;
+            init_pose = initial_pnp_.solve(match_res, pnp_pts_3d, camera_.K);
+            result.timing["initial_pnp"] = 0.0;
+            use_init = init_pose.success;
+        } else {
+            std::cout << "  [InitialPnP] Skipped (use_initial_pnp=false)" << std::endl;
+        }
+
+        if (use_init) {
+            pose = gpnp_solver_.solve(result, pnp_pts_3d, &init_pose.R, &init_pose.t, gpnp_timing);
+        } else {
+            // Fallback: depth from disparity
+            Eigen::Matrix3d R_id = Eigen::Matrix3d::Identity();
+            double depth_from_disp = 500.0;  // default 500mm
+            if (!result.disparity.empty()) {
+                std::vector<double> abs_disp;
+                for (double d : result.disparity) abs_disp.push_back(std::abs(d));
+                double med_disp = computeMedian(std::move(abs_disp));
+                if (med_disp > 1.0) {
+                    depth_from_disp = camera_.focal_length * camera_.baseline / med_disp;
+                    depth_from_disp = std::clamp(depth_from_disp, 50.0, 5000.0);
+                    std::cout << "  [BinaryCorner] Depth from disparity: " << static_cast<int>(depth_from_disp)
+                              << "mm (median_disp=" << static_cast<int>(med_disp) << "px)" << std::endl;
+                }
+            }
+            Eigen::Vector3d t_id(0, 0, depth_from_disp);
+            pose = gpnp_solver_.solve(result, pnp_pts_3d, &R_id, &t_id, gpnp_timing);
+        }
     } else {
         const Eigen::Matrix3d* Rp = state_.has_cache ? &state_.R_prev : nullptr;
         const Eigen::Vector3d* tp = state_.has_cache ? &state_.t_prev : nullptr;
@@ -423,34 +454,149 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
             }
 
             // --- Panel 4: Reprojection on expanded left view ---
+            // Uses GPNP-consistent 2D↔3D correspondence via train_lut
+            // (same LUT-based intersection as GPnPSolver::solve)
             if (pose.success && !pnp_pts_3d.empty()) {
                 cv::Mat p4 = view_L.clone();
-                std::vector<cv::Point3d> obj_pts;
-                for (const auto& p3d : pnp_pts_3d)
-                    obj_pts.emplace_back(p3d.x(), p3d.y(), p3d.z());
-                std::vector<cv::Point2d> projected;
-                cv::Mat rvec4, tvec4(3, 1, CV_64F);
-                tvec4.at<double>(0) = pose.t(0); tvec4.at<double>(1) = pose.t(1);
-                tvec4.at<double>(2) = pose.t(2);
-                cv::Mat R4(3, 3, CV_64F);
-                for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c)
-                    R4.at<double>(r, c) = pose.R(r, c);
-                cv::Rodrigues(R4, rvec4);
-                cv::Mat K4(3, 3, CV_64F);
-                for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c)
-                    K4.at<double>(r, c) = camera_.K(r, c);
-                cv::projectPoints(obj_pts, rvec4, tvec4, K4, cv::Mat(), projected);
 
-                for (size_t i = 0; i < projected.size() && i < result.pts_left_match.size(); ++i) {
-                    cv::Point2f obs_v = toView_L(result.pts_left_match[i]);
-                    cv::Point pd(static_cast<int>(projected[i].x - expand_L.x),
-                                 static_cast<int>(projected[i].y - expand_L.y));
+                // Build train_lut from good_matches (identical to GPnPSolver logic)
+                int max_qidx = 0;
+                for (const auto& m : result.good_matches)
+                    max_qidx = std::max(max_qidx, m.queryIdx);
+                std::vector<int> train_lut(max_qidx + 1, -1);
+                for (const auto& m : result.good_matches)
+                    train_lut[m.queryIdx] = m.trainIdx;
+
+                // Build observation → 3D mapping via idx_from_filtered
+                // obs_to_3d[j] = train_idx of 3D point for observed point j
+                // (only for observed points that GPNP actually used)
+                std::vector<int> obs_to_3d(result.pts_left_good.size(), -1);
+                std::vector<int> used_3d_indices;  // which 3D pts have observations
+                for (size_t j = 0; j < result.pts_left_good.size() &&
+                                    j < result.idx_from_filtered.size(); ++j) {
+                    int kp_idx = result.idx_from_filtered[j];
+                    if (kp_idx >= 0 && kp_idx < static_cast<int>(train_lut.size())) {
+                        int tr_idx = train_lut[kp_idx];
+                        if (tr_idx >= 0 && tr_idx < static_cast<int>(pnp_pts_3d.size())) {
+                            obs_to_3d[j] = tr_idx;
+                            used_3d_indices.push_back(tr_idx);
+                        }
+                    }
+                }
+
+                // Project only the 3D points that have observed counterparts
+                std::vector<cv::Point3d> obj_pts;
+                obj_pts.reserve(used_3d_indices.size());
+                for (int idx : used_3d_indices)
+                    obj_pts.emplace_back(pnp_pts_3d[idx].x(), pnp_pts_3d[idx].y(), pnp_pts_3d[idx].z());
+
+                std::vector<cv::Point2d> projected;
+                if (!obj_pts.empty()) {
+                    cv::Mat rvec4, tvec4(3, 1, CV_64F);
+                    tvec4.at<double>(0) = pose.t(0); tvec4.at<double>(1) = pose.t(1);
+                    tvec4.at<double>(2) = pose.t(2);
+                    cv::Mat R4(3, 3, CV_64F);
+                    for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c)
+                        R4.at<double>(r, c) = pose.R(r, c);
+                    cv::Rodrigues(R4, rvec4);
+                    cv::Mat K4(3, 3, CV_64F);
+                    for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c)
+                        K4.at<double>(r, c) = camera_.K(r, c);
+                    cv::projectPoints(obj_pts, rvec4, tvec4, K4, cv::Mat(), projected);
+                }
+
+                // Build reverse map: 3D index → projected array index
+                std::unordered_map<int, size_t> proj_map;
+                for (size_t k = 0; k < used_3d_indices.size(); ++k)
+                    proj_map[used_3d_indices[k]] = k;
+
+                // Draw: for each observed point that has a 3D match,
+                // connect it to the projected position of that 3D point
+                for (size_t j = 0; j < result.pts_left_good.size(); ++j) {
+                    int tr_idx = obs_to_3d[j];
+                    if (tr_idx < 0) continue;
+
+                    auto it = proj_map.find(tr_idx);
+                    if (it == proj_map.end() || it->second >= projected.size()) continue;
+
+                    cv::Point2f obs_v = toView_L(result.pts_left_good[j]);
+                    cv::Point pd(static_cast<int>(projected[it->second].x - expand_L.x),
+                                 static_cast<int>(projected[it->second].y - expand_L.y));
                     cv::Point pm(static_cast<int>(obs_v.x), static_cast<int>(obs_v.y));
-                    cv::circle(p4, pd, 1, cv::Scalar(0, 255, 0), -1);
-                    cv::circle(p4, pm, 1, cv::Scalar(0, 0, 255), 1);
-                    cv::line(p4, pd, pm, cv::Scalar(0, 255, 255), 1);
+                    cv::circle(p4, pd, 1, cv::Scalar(0, 255, 0), -1);   // green = projected
+                    cv::circle(p4, pm, 1, cv::Scalar(0, 0, 255), 1);    // red = observed
+                    cv::line(p4, pd, pm, cv::Scalar(0, 255, 255), 1);   // yellow = error vector
                 }
                 cv::imwrite(output_dir_ + "/binary_corner_reproj" + prefix + ".png", p4);
+            }
+
+            // --- Panel 5: Stereo projection (AKAZE-style, using disparity depth) ---
+            // Projects left corners → right image via stereo geometry, independent of GPNP pose.
+            if (!result.pts_left_good.empty() && !result.pts_right_good.empty()) {
+                cv::Mat p5 = view_L.clone();
+                const double fx = camera_.focal_length;
+                const double fy = camera_.K(1,1);
+                const double cx = camera_.K(0,2);
+                const double cy = camera_.K(1,2);
+                const double b  = camera_.baseline;
+                const Eigen::Matrix3d& R_rl = camera_.R_rl;
+                const Eigen::Vector3d& t_rl = camera_.t_rl;
+
+                int n_stereo_proj = std::min(static_cast<int>(result.pts_left_good.size()),
+                                              static_cast<int>(result.pts_right_good.size()));
+
+                for (int i = 0; i < n_stereo_proj; ++i) {
+                    double uL = result.pts_left_good[i].x;
+                    double vL = result.pts_left_good[i].y;
+                    double uR = result.pts_right_good[i].x;
+                    double vR = result.pts_right_good[i].y;
+
+                    // Stereo depth from disparity
+                    double disp = uL - uR;  // raw horizontal disparity
+                    double abs_disp = std::abs(disp);
+                    if (abs_disp < 0.5) continue;  // degenerate
+
+                    double depth = fx * b / abs_disp;
+                    if (depth <= 0.0 || depth > 100000.0) continue;  // 100m limit
+
+                    // Left camera ray
+                    double rx = (uL - cx) / fx;
+                    double ry = (vL - cy) / fy;
+                    double rn = std::sqrt(rx*rx + ry*ry + 1.0);
+                    rx /= rn; ry /= rn;
+                    double rz = 1.0 / rn;
+
+                    // 3D point in left camera frame
+                    double Px = rx * depth;
+                    double Py = ry * depth;
+                    double Pz = rz * depth;
+
+                    // Transform to right camera frame: P_right = R_rl^T * (P_left - t_rl)
+                    double dx = Px - t_rl(0);
+                    double dy = Py - t_rl(1);
+                    double dz = Pz - t_rl(2);
+                    double PRx = dx*R_rl(0,0) + dy*R_rl(1,0) + dz*R_rl(2,0);  // (P_left - t_rl)^T * R_rl
+                    double PRy = dx*R_rl(0,1) + dy*R_rl(1,1) + dz*R_rl(2,1);
+                    double PRz = dx*R_rl(0,2) + dy*R_rl(1,2) + dz*R_rl(2,2);
+
+                    if (std::abs(PRz) < 1e-6) continue;
+
+                    // Project to right image
+                    double proj_x = fx * PRx / PRz + cx;
+                    double proj_y = fy * PRy / PRz + cy;
+
+                    // Draw on left expanded view
+                    cv::Point2f obs_v = toView_L(result.pts_left_good[i]);
+                    cv::Point pt_L(static_cast<int>(obs_v.x), static_cast<int>(obs_v.y));
+                    cv::Point pt_R(static_cast<int>(proj_x - expand_L.x),
+                                   static_cast<int>(proj_y - expand_L.y));
+
+                    cv::circle(p5, pt_L, 4, cv::Scalar(255, 0, 0), -1);        // blue = left observed
+                    cv::drawMarker(p5, pt_R, cv::Scalar(0, 0, 255),
+                                   cv::MARKER_TILTED_CROSS, 10, 2);             // red cross = right projected
+                    cv::line(p5, pt_L, pt_R, cv::Scalar(0, 255, 0), 1, cv::LINE_AA);  // green = disparity
+                }
+                cv::imwrite(output_dir_ + "/binary_corner_stereo_proj" + prefix + ".png", p5);
             }
         }
     }
@@ -486,8 +632,13 @@ void StereoTracker::clearCache() { state_ = TrackingState{}; }
 void StereoTracker::setExtractor(std::unique_ptr<FeatureExtractor> extractor) {
     if (!extractor) return;
 
-    // If the new extractor is AKAZE-based, ensure camera is initialized
-    // (other strategies don't need camera params at extract time)
+    // AKAZE-based extractors need camera init + cached template data.
+    // Inject both here so callers (main.cpp) don't need to re-extract.
+    if (auto* akaze = dynamic_cast<AkazeGpnpExtractor*>(extractor.get())) {
+        akaze->initCamera(camera_);
+        akaze->setTemplateData(template_);  // use cached TemplateData (no re-extraction)
+    }
+
     extractor_ = std::move(extractor);
     std::cout << "[StereoTracker] Switched to extractor: "
               << extractor_->name() << std::endl;

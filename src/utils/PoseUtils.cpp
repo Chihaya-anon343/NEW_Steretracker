@@ -213,7 +213,7 @@ std::vector<cv::Point2f> orderPoints(const std::vector<cv::Point2f>& pts) {
     std::vector<double> sum(4), diff(4);
     for (int i = 0; i < 4; ++i) {
         sum[i]  = pts[i].x + pts[i].y;
-        diff[i] = pts[i].y - pts[i].x;
+        diff[i] = pts[i].x - pts[i].y;  // x-y: TR has large x-y (image coords, Y↓)
     }
 
     // TL = min(sum), BR = max(sum)

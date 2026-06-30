@@ -1,10 +1,14 @@
 {
   "input": {
-    "left": "data/rotated/cj06_image_0254_150 - 副本.png",
-    "right": "data/rotated/cj06_image_0254_150.png"
+    "left": "data/中图/cj06_image_0181_rot180 - 副本.jpg",
+    "right": "data/中图/cj06_image_0181_rot180.jpg"
   },
   "output": {
     "visualize": true
+  },
+
+  "TODO": {
+    "BINARY CORNER": "要修改BC方法的NEWMUBAN中的点的顺序"
   },
 
   "camera": {
@@ -29,7 +33,7 @@
     "tiny_max_area": 800,
 
     "akaze_gpnp": {
-      "template_path": "data/大图/img_1.png",
+      "template_path": "data/大图/img.png",
       "template_real_width_mm": 500.0,
       "template_real_height_mm": 500.0,
       "scale": 0.5,

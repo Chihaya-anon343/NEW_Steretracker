@@ -120,12 +120,14 @@ private:
     // ========================================================================
 
     /// Core corner extraction from a binary image (0/255).
-    /// @param binary_img   Otsu-binarized ROI
-    /// @param gray_roi     Original grayscale ROI（用于先旋转再二值化，提高精度）
-    /// @param out_corners  输出的角点（ROI局部坐标）
+    /// @param binary_img      Otsu-binarized ROI
+    /// @param gray_roi        Original grayscale ROI（用于先旋转再二值化，提高精度）
+    /// @param out_corners     输出的角点（ROI局部坐标）
+    /// @param preset_template 可选：预设模板，非空时跳过 findBestMatch() 直接使用
     Status extractFromBinary(const cv::Mat& binary_img,
                               const cv::Mat& gray_roi,
-                              std::vector<cv::Point2f>& out_corners);
+                              std::vector<cv::Point2f>& out_corners,
+                              const TemplateData* preset_template = nullptr);
 
     cv::Mat keepLargestRegion(const cv::Mat& binary_img);
     cv::Mat keepRegionFromCenter(const cv::Mat& binary_img);
