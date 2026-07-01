@@ -210,14 +210,25 @@ PipelineResult BinaryCornerExtractor::extract(const cv::Mat& left_gray,
     // 5c. Template matching data (for GPNP: good_matches → queryIdx↔trainIdx)
     result.pts_left_match = left_corners;
 
-    if (matched_tmpl != nullptr) {
+    // Find angle-0 template (always use 0° as 3D reference regardless of matched angle)
+    const TemplateData* tmpl_0 = nullptr;
+    for (const auto& t : templates_) {
+        if (t.angle == 0) {
+            tmpl_0 = &t;
+            break;
+        }
+    }
+    // Fallback to matched template if no angle-0 available
+    if (tmpl_0 == nullptr) tmpl_0 = matched_tmpl;
+
+    if (tmpl_0 != nullptr) {
         // Scale template corners to left ROI size
         double scale_x = static_cast<double>(left_gray.cols)
-                       / matched_tmpl->image.cols;
+                       / tmpl_0->image.cols;
         double scale_y = static_cast<double>(left_gray.rows)
-                       / matched_tmpl->image.rows;
+                       / tmpl_0->image.rows;
 
-        result.pts_template_match = matched_tmpl->corners;
+        result.pts_template_match = tmpl_0->corners;
         for (auto& pt : result.pts_template_match) {
             pt.x *= static_cast<float>(scale_x);
             pt.y *= static_cast<float>(scale_y);
@@ -228,7 +239,7 @@ PipelineResult BinaryCornerExtractor::extract(const cv::Mat& left_gray,
         // GPNP uses train_lut[queryIdx]=trainIdx to map stereo points → 3D points.
         // With 1:1 correspondence: train_lut[i] = i.
         int n_match = std::min(static_cast<int>(left_corners.size()),
-                               static_cast<int>(matched_tmpl->corners.size()));
+                               static_cast<int>(tmpl_0->corners.size()));
         result.good_matches.reserve(n_match);
         for (int i = 0; i < n_match; ++i) {
             result.good_matches.emplace_back(i, i, 0.0f);  // queryIdx, trainIdx, distance=0
@@ -236,9 +247,10 @@ PipelineResult BinaryCornerExtractor::extract(const cv::Mat& left_gray,
     }
 
     // 5d. Generate 3D object points (planar target, z=0) — in MILLIMETERS (GPNP unit).
-    if (matched_tmpl != nullptr && config_.pixel_to_meter_scale > 0.0) {
+    //     Always use angle-0 template corners so PnP yields meaningful rotation.
+    if (tmpl_0 != nullptr && config_.pixel_to_meter_scale > 0.0) {
         double s_mm_per_px = config_.pixel_to_meter_scale * 1000.0;  // m/px → mm/px
-        const auto& tc = matched_tmpl->corners;
+        const auto& tc = tmpl_0->corners;
         template_data_.pts_3d.clear();
         template_data_.pts_3d.reserve(tc.size());
         for (const auto& pt : tc) {
@@ -246,7 +258,7 @@ PipelineResult BinaryCornerExtractor::extract(const cv::Mat& left_gray,
                                                pt.y * s_mm_per_px, 0.0);
         }
         std::cout << "[BinaryCorner] 3D pts (mm): " << template_data_.pts_3d.size()
-                  << " (scale=" << s_mm_per_px << " mm/px)" << std::endl;
+                  << " (angle=0, scale=" << s_mm_per_px << " mm/px)" << std::endl;
     }
 
     // desc_left remains empty (no AKAZE descriptors)
