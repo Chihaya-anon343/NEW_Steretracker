@@ -173,6 +173,7 @@ PoseEstimate InitialPnPSolver::solve(
         std::cout << "  [InitialPnP] Success | n=" << n_pts
                   << " | inliers=" << n_inliers
                   << " | t=[" << result.t(0) << "," << result.t(1) << "," << result.t(2) << "]"
+                  << " | r=[" << result.R << "]"
                   << std::endl;
 
     } catch (const std::exception& e) {

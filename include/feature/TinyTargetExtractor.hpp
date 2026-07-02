@@ -47,6 +47,8 @@ public:
 
     std::string name() const override { return "TinyTarget"; }
 
+    StrategyType strategyType() const override { return StrategyType::TinyTarget; }
+
     void setTemplateData(const std::string& template_dir,
                          double real_width_mm,
                          double real_height_mm) override;

@@ -1,7 +1,7 @@
 {
   "input": {
-    "left": "data/中图/cj06_image_0181_rot180 - 副本.jpg",
-    "right": "data/中图/cj06_image_0181_rot180.jpg"
+    "left": "data/delivery_area_2l/im0.png",
+    "right": "data/delivery_area_2l/im1.png"
   },
   "output": {
     "visualize": true
@@ -29,13 +29,20 @@
     "roi_min_size": 0
   },
 
+  "manual_roi": {
+    "_comment": "设为 true 则跳过 YOLO，直接使用下方 ROI；设为 false 则走正常 YOLO 流程",
+    "enabled": true,
+    "left":   { "x": 416, "y": 113, "width": 300, "height": 300 },
+    "right":  { "x": 410, "y": 113, "width": 300, "height": 300 }
+  },
+
   "strategies": {
     "_comment": "ROI area thresholds: <= tiny_max → TinyTarget, >= akaze_min → AKAZE, else BinaryCorner",
     "akaze_min_area": 40001,
     "tiny_max_area": 800,
 
     "akaze_gpnp": {
-      "template_path": "data/大图/img.png",
+      "template_path": "data/delivery_area_2l/im0 - 副本.png",
       "template_real_width_mm": 500.0,
       "template_real_height_mm": 500.0,
       "scale": 0.5,
@@ -44,7 +51,7 @@
     },
 
     "binary_corner": {
-      "template_dir": "data/NewMuBan",
+      "template_dir": "data/NewMuBan(reordered)",
       "corners": 10,
       "kernel_size": 3,
       "corner_scale": 3.0,
@@ -56,7 +63,7 @@
     },
 
     "tiny_target": {
-      "template_dir": "data/NewMuBan",
+      "template_dir": "data/NewMuBan(reordered)",
       "target_width": 50,
       "target_height": 50,
       "scale_factor": 4,

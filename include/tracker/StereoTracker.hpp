@@ -56,8 +56,15 @@ public:
     const std::vector<LogEntry>& getLogs() const;
     void printLogs() const;
 
-    /// Replace the feature extraction strategy at runtime.
+    /// Replace the primary feature extraction strategy at runtime.
     void setExtractor(std::unique_ptr<FeatureExtractor> extractor);
+
+    /// Add a fallback feature extractor. Fallbacks are tried in order of registration
+    /// when the primary extractor (or a higher-priority fallback) fails.
+    void addFallbackExtractor(std::unique_ptr<FeatureExtractor> extractor);
+
+    /// Clear all registered fallback extractors (for per-frame re-registration).
+    void clearFallbackExtractors();
 
     /// Set output directory for visualization images (created by main.cpp).
     void setOutputDir(const std::string& dir) { output_dir_ = dir; }
@@ -100,6 +107,58 @@ private:
     // ========================================================================
 
     static std::pair<cv::Mat, cv::Mat> loadImage(const cv::Mat& img);
+
+    // ========================================================================
+    // Degradation: fallback extraction chain
+    // ========================================================================
+
+    /// Fallback extractors, tried in registration order when primary fails.
+    std::vector<std::unique_ptr<FeatureExtractor>> fallback_extractors_;
+
+    // ========================================================================
+    // Degradation helpers
+    // ========================================================================
+
+    /// Run extraction + coordinate restore for one extractor on pre-cropped ROIs.
+    /// Returns true if extraction produced meaningful results.
+    bool runExtraction(FeatureExtractor& ext,
+                       const cv::Mat& left_gray, const cv::Mat& right_gray,
+                       const cv::Mat& left_color, const cv::Mat& right_color,
+                       const cv::Point2d& left_offset, const cv::Point2d& right_offset,
+                       const cv::Mat& left_color_orig, const cv::Mat& right_color_orig,
+                       PipelineResult& result);
+
+    /// ROI crop helper: extract ROI from stereo pair.
+    struct StereoRoi {
+        cv::Mat left_gray, right_gray;
+        cv::Mat left_color, right_color;
+        cv::Point2d left_offset, right_offset;
+    };
+    StereoRoi cropStereoRoi(const cv::Mat& left_img, const cv::Mat& right_img,
+                            const RoiRect* left_roi, const RoiRect* right_roi);
+
+    // ========================================================================
+    // PnP dispatch — strategy-specific pose estimation
+    // ========================================================================
+
+    /// Dispatch PnP based on strategy type, returning {ok, pose}.
+    std::pair<bool, PoseEstimate> dispatchPnP(FeatureExtractor* ext,
+                                               PipelineResult& result, bool is_first);
+
+    /// Run AKAZE path PnP (MAD pre-filtered data assumed).
+    /// Returns {ok, pose}. If is_first && InitialPnP succeeded but GPNP failed,
+    /// returns {true, InitialPnP_pose} — do NOT degrade.
+    std::pair<bool, PoseEstimate> runAkazePnP(PipelineResult& result, bool is_first);
+
+    /// Run BinaryCorner path PnP.
+    /// Returns {ok, pose}. Same InitialPnP fallback semantics as AKAZE.
+    std::pair<bool, PoseEstimate> runBinaryCornerPnP(PipelineResult& result, bool is_first);
+
+    /// Run TinyTarget path PnP (cv::solvePnP).
+    std::pair<bool, PoseEstimate> runTinyTargetPnP(PipelineResult& result);
+
+    /// Merge a successful pose into final PipelineResult and update tracking state.
+    void finalizePose(PipelineResult& result, const PoseEstimate& pose);
 
     // ========================================================================
     // Logging

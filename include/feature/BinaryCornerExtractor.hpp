@@ -54,6 +54,8 @@ public:
 
     std::string name() const override { return "BinaryCorner"; }
 
+    StrategyType strategyType() const override { return StrategyType::BinaryCorner; }
+
     void setTemplateData(const std::string& template_dir,
                          double real_width_mm,
                          double real_height_mm) override;

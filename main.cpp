@@ -9,7 +9,7 @@
 #include "tracker/StereoTracker.hpp"
 #include "detection/YoloRoiProvider.hpp"
 #include "common/GeometryUtils.hpp"
-#include "feature/FeatureExtractorFactory.hpp"
+#include "feature/AkazeGpnpExtractor.hpp"
 #include "feature/BinaryCornerExtractor.hpp"
 #include "feature/TinyTargetExtractor.hpp"
 
@@ -77,10 +77,33 @@ int main(int argc, char** argv) {
     float expand = fs["yolo"]["roi_expand_ratio"];
     int min_roi = fs["yolo"]["roi_min_size"];
 
+    // 策略选择阈值（从 JSON 读取，替代原硬编码常量）
+    int akaze_min_area = fs["strategies"]["akaze_min_area"];
+    int tiny_max_area  = fs["strategies"]["tiny_max_area"];
+
     // 输入输出
     std::string left_path  = fs["input"]["left"];
     std::string right_path = fs["input"]["right"];
     bool visualize = static_cast<int>(fs["output"]["visualize"]) != 0;
+
+    // 手动 ROI 配置（若 enabled=true 则跳过 YOLO，直接使用指定 ROI）
+    bool use_manual_roi = false;
+    RoiRect manual_rl, manual_rr;
+    cv::FileNode manual_node = fs["manual_roi"];
+    if (!manual_node.empty()) {
+        int enabled = manual_node["enabled"];
+        if (enabled) {
+            use_manual_roi = true;
+            manual_rl.x      = manual_node["left"]["x"];
+            manual_rl.y      = manual_node["left"]["y"];
+            manual_rl.width  = manual_node["left"]["width"];
+            manual_rl.height = manual_node["left"]["height"];
+            manual_rr.x      = manual_node["right"]["x"];
+            manual_rr.y      = manual_node["right"]["y"];
+            manual_rr.width  = manual_node["right"]["width"];
+            manual_rr.height = manual_node["right"]["height"];
+        }
+    }
 
     fs.release();
 
@@ -136,30 +159,58 @@ int main(int argc, char** argv) {
         for (int frame = 1; frame <= 2; ++frame) {
             std::cout << "\n===== 第 " << frame << " 帧 =====" << std::endl;
 
-            // YOLO 检测 → 获取 ROI
+            // 获取 ROI：手动输入 > YOLO 检测
             RoiRect rl, rr;
-            if (yolo_ok) std::tie(rl, rr) = yolo.detect(left_img, right_img);
+            if (use_manual_roi) {
+                rl = manual_rl;
+                rr = manual_rr;
+                std::cout << "  手动 ROI: left=(" << rl.x << "," << rl.y << ","
+                          << rl.width << "," << rl.height << "), right=("
+                          << rr.x << "," << rr.y << "," << rr.width << "," << rr.height << ")" << std::endl;
+            } else if (yolo_ok) {
+                std::tie(rl, rr) = yolo.detect(left_img, right_img);
+            }
 
             // 根据 ROI 面积选择特征提取策略
-            if (rl.valid()) {
-                int roi_area = rl.width * rl.height;
-                auto ext = createFeatureExtractor(
-                    roi_area, scale, tracker_cfg.lk_params,
-                    binary_template_dir, binary_cfg, tiny_cfg);
-                // AKAZE 初始化（相机 + 模板缓存）已由 setExtractor() 内部处理
-                tracker.setExtractor(std::move(ext));
-            } else {
-                // 无检测结果 → 默认 AKAZE
+            int roi_area = rl.valid() ? rl.width * rl.height : 0;
+
+            // Clear previous frame's fallbacks
+            tracker.clearFallbackExtractors();
+
+            if (roi_area >= akaze_min_area || roi_area == 0) {
+                // Large ROI or no detection → AKAZE primary
                 auto akaze = std::make_unique<AkazeGpnpExtractor>(
                     scale, tracker_cfg.lk_params);
                 tracker.setExtractor(std::move(akaze));
+
+                // Fallback chain: AKAZE → BinaryCorner → TinyTarget
+                auto fb_bc = std::make_unique<BinaryCornerExtractor>(
+                    binary_cfg, binary_template_dir);
+                tracker.addFallbackExtractor(std::move(fb_bc));
+                auto fb_tt = std::make_unique<TinyTargetExtractor>(
+                    tiny_cfg, tiny_template_dir);
+                tracker.addFallbackExtractor(std::move(fb_tt));
+            } else if (roi_area > tiny_max_area) {
+                // Medium ROI → BinaryCorner primary
+                auto bc = std::make_unique<BinaryCornerExtractor>(
+                    binary_cfg, binary_template_dir);
+                tracker.setExtractor(std::move(bc));
+
+                // Fallback chain: BinaryCorner → TinyTarget
+                auto fb_tt = std::make_unique<TinyTargetExtractor>(
+                    tiny_cfg, tiny_template_dir);
+                tracker.addFallbackExtractor(std::move(fb_tt));
+            } else {
+                // Small ROI → TinyTarget primary (no further fallback)
+                auto tt = std::make_unique<TinyTargetExtractor>(
+                    tiny_cfg, tiny_template_dir);
+                tracker.setExtractor(std::move(tt));
             }
 
             // 非 AKAZE 策略：按配置扩大 ROI，给角点提取提供周围上下文
             {
-                int roi_area = rl.valid() ? rl.width * rl.height : 0;
-                int pad = (roi_area > 0 && roi_area <= 800)     ? tiny_cfg.roi_pad_pixels
-                        : (roi_area > 800 && roi_area < 40001)  ? binary_cfg.roi_pad_pixels
+                int pad = (roi_area > 0 && roi_area <= tiny_max_area)     ? tiny_cfg.roi_pad_pixels
+                        : (roi_area > tiny_max_area && roi_area < akaze_min_area)  ? binary_cfg.roi_pad_pixels
                         : 0;
                 if (pad > 0 && rl.valid()) {
                     rl = RoiRect{std::max(0, rl.x - pad),

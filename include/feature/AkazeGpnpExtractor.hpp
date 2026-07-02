@@ -45,6 +45,8 @@ public:
 
     std::string name() const override { return "AkazeGpnp"; }
 
+    StrategyType strategyType() const override { return StrategyType::Akaze; }
+
     void setTemplateData(const std::string& template_dir,
                          double real_width_mm,
                          double real_height_mm) override;

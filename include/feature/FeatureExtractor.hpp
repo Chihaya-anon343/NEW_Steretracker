@@ -19,6 +19,13 @@
 
 namespace gpnp {
 
+/// Strategy type for degradation chain dispatch.
+enum class StrategyType {
+    Akaze,          ///< AKAZE feature extraction + optical flow + GPNP
+    BinaryCorner,   ///< Otsu binary contour corner extraction + GPNP
+    TinyTarget      ///< Super-resolution minAreaRect 4-point extraction + solvePnP
+};
+
 /// Abstract interface for feature extraction strategies.
 ///
 /// Each strategy implements feature extraction + template matching,
@@ -30,6 +37,9 @@ public:
 
     /// Human-readable strategy name for logging.
     virtual std::string name() const = 0;
+
+    /// Strategy type for PnP dispatch and degradation chain ordering.
+    virtual StrategyType strategyType() const = 0;
 
     /// Accept and load template data (called once after construction).
     ///

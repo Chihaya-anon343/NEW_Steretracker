@@ -56,7 +56,6 @@ set(SOURCES
     src/feature/AkazeExtractor.cpp
     src/feature/AkazeGpnpExtractor.cpp
     src/feature/BinaryCornerExtractor.cpp
-    src/feature/FeatureExtractorFactory.cpp
     src/feature/MadDisparityFilter.cpp
     src/feature/OpticalFlowTracker.cpp
     src/feature/TinyTargetExtractor.cpp
