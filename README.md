@@ -21,30 +21,19 @@
                                    │
                     ┌──────────────▼──────────────┐
                     │      逐 帧 循 环             │
-                    └──────────────┬──────────────┘                   │
+                    └──────────────┬──────────────┘
+                                   │
                     ┌──────────────▼──────────────┐
                     │  ① YOLO ONNX 目标检测        │
                     │     输出 左右 ROI 矩形        │
                     └──────────────┬──────────────┘
                                    │
                     ┌──────────────▼──────────────┐
-                    │  ② ROI 面积判定 → 主策略选择    │
-                    │      + 注册退化后备链          │
+                    │  ② StereoTracker::process() │
+                    │     策略链选择 + ROI padding  │
+                    │     特征提取 + 退化 + 位姿    │
+                    │     (全部内部自动完成)        │
                     └──────────────┬──────────────┘
-                                   │
-              ┌────────────────────┼────────────────────┐
-              │                    │                    │
-     ┌────────▼────────┐  ┌───────▼────────┐  ┌────────▼────────┐
-     │ 主: TinyTarget   │  │ 主: BinaryCorner│  │ 主: AKAZE_GPNP │
-     │ ROI ≤ 800 px²   │  │ 801~40000 px²  │  │ ≥40001 / 无检测 │
-     │ → solvePnP      │  │ → GPNP (LM)    │  │ → GPNP (LM)    │
-     │ (无进一步后备)    │  │   ↕ 失败退化     │  │   ↕ 失败退化     │
-     │                  │  │ 备: TinyTarget  │  │ 备1: BinaryCorner│
-     │                  │  │                │  │   ↕ 失败退化     │
-     │                  │  │                │  │ 备2: TinyTarget  │
-     └────────┬────────┘  └───────┬────────┘  └────────┬────────┘
-              │                    │                    │
-              └────────────────────┼────────────────────┘
                                    │
                     ┌──────────────▼──────────────┐
                     │  ③ 输出位姿 [R|t] + 日志      │
@@ -52,6 +41,7 @@
                     └─────────────────────────────┘
 ```
 
+帧循环中 `main.cpp` 仅负责获取 ROI 并调用 `tracker.process()`，所有策略选择和特征提取由 `StereoTracker` 内部自动完成。
 
 ---
 
@@ -59,7 +49,7 @@
 
 ### 2.1 主策略选择
 
-系统根据 YOLO 检测到的 ROI 面积自动选择**主**特征提取策略：
+系统根据 ROI 面积自动选择**主**特征提取策略：
 
 | ROI 面积 | 主策略 | 提取器 | 位姿解算 |
 |----------|------|--------|----------|
@@ -67,7 +57,7 @@
 | 801 ~ 40000 px² | BinaryCorner | `BinaryCornerExtractor` | `GPnPSolver` (Eigen LM) |
 | ≥ 40001 px² / 无检测 | AKAZE_GPNP | `AkazeGpnpExtractor` | `GPnPSolver` (Eigen LM) |
 
-主策略由 `main.cpp` 中的 ROI 面积判定逻辑选择，通过 `StereoTracker::setExtractor()` 热切换。
+三种提取器在 `StereoTracker` **构造时一次性预创建并加载全部模板**。每帧 `process()` 内部调用 `configureStrategyChain()` 仅通过**指针切换**来选择活跃的主策略和退化链，零堆分配开销。
 
 ### 2.2 退化后备链
 
@@ -90,21 +80,21 @@ AKAZE_GPNP  ──失败──→  BinaryCorner  ──失败──→  TinyTarg
 3. 后备策略提取成功 → 走**该后备策略对应的** PnP 路径（如 BinaryCorner 走 GPNP，TinyTarget 走 solvePnP）
 4. 所有策略失败 → 输出 `All strategies failed`
 
-PnP 分发由 `dispatchPnP()` 根据每个 extractor 的 `strategyType()` 自动路由到 `runAkazePnP()` / `runBinaryCornerPnP()` / `runTinyTargetPnP()`，确保退化后的位姿解算与策略匹配。
+PnP 分发由 `dispatchPnP()` 根据每个 extractor 的 `name()` 自动路由到 `runAkazePnP()` / `runBinaryCornerPnP()` / `runTinyTargetPnP()`，确保退化后的位姿解算与策略匹配。
 
 ### 2.3 API
 
 ```cpp
-// 设置主策略
-tracker.setExtractor(std::make_unique<AkazeGpnpExtractor>(...));
+// StereoTracker 构造函数 — 预创建全部 3 种提取器并加载模板
+StereoTracker tracker(K, R_rl, t_rl, template_path, tracker_cfg,
+                      binary_cfg, binary_template_dir,
+                      tiny_cfg, tiny_template_dir);
 
-// 注册后备（按优先级顺序）
-tracker.addFallbackExtractor(std::make_unique<BinaryCornerExtractor>(...));
-tracker.addFallbackExtractor(std::make_unique<TinyTargetExtractor>(...));
-
-// 每帧清空并重新注册
-tracker.clearFallbackExtractors();
+// 每帧处理 — 策略链选择 + ROI padding + 退化全部内部自动完成
+auto result = tracker.process(left_img, right_img, visualize, &left_roi, &right_roi);
 ```
+
+旧 API `setExtractor()` / `addFallbackExtractor()` / `clearFallbackExtractors()` 已移除。策略链配置由私有方法 `configureStrategyChain(int roi_area)` 完成，对外不可见。
 
 ### 2.4 FeatureExtractor 基类
 
@@ -113,12 +103,13 @@ enum class StrategyType { Akaze, BinaryCorner, TinyTarget };
 
 class FeatureExtractor {
 public:
-    virtual StrategyType strategyType() const = 0;  // 用于 PnP 路由和退化链去重
+    virtual std::string name() const = 0;          // 用于 PnP 路由和退化链去重
+    virtual PipelineResult extract(...) = 0;       // 核心提取逻辑
     // ...
 };
 ```
 
-**ROI 外扩**：在送入提取器前，BinaryCorner 和 TinyTarget 策略会外扩 ROI 边距（`roi_pad_pixels`），为角点提取提供周围上下文像素。
+**ROI 外扩**：在送入提取器前，BinaryCorner 和 TinyTarget 策略会由 `applyRoiPadding()` 自动外扩 ROI 边距（`roi_pad_pixels`），为角点提取提供周围上下文像素。
 
 ---
 
@@ -305,7 +296,7 @@ TinyTarget **不走 GPNP 优化**，而是直接用 OpenCV 的 `cv::solvePnP(cv:
 
 ---
 
-## 5. 策略三：AKAZE_GPNP（ROI ≥ 40001 px² / 无检测回退）
+## 5. 策略三：AKAZE_GPNP（ROI ≥ 40001 px² / 无检测）
 
 **适用场景**：大尺寸 / 全图纹理丰富的目标（传统 AKAZE 特征匹配方案）。
 
@@ -438,7 +429,7 @@ GPNP 输出位姿需通过以下全部校验：
 | 结构体 | 用途 |
 |--------|------|
 | `StereoCameraParams` | 双目相机内外参 (K, R_rl, t_rl, focal_length, baseline) |
-| `TrackerConfig` | 跟踪器配置 (scale, gpnp_min_pts, use_initial_pnp, LK 参数) |
+| `TrackerConfig` | 跟踪器配置 (scale, gpnp_min_pts, use_initial_pnp, LK 参数, akaze_min_area, tiny_max_area) |
 | `PipelineResult` | 单帧完整输出: 特征、光流、投影、匹配、位姿、计时 |
 | `TrackResult` | 光流跟踪结果: 左右匹配点、视差、FB 统计 |
 | `ProjectionResult` | 立体投影结果: 投影点、valid_mask |
@@ -458,58 +449,75 @@ GPNP 输出位姿需通过以下全部校验：
 
 ```jsonc
 {
-  "camera": {
-    "fx": 1400.0,          // 焦距 × 像素/mm
-    "fy": 1400.0,
-    "cx": 960.0,           // 主点坐标
-    "cy": 540.0,
-    "baseline_mm": 120.0   // 双目基线 (mm)
-  },
-  "strategies": {
-    "akaze_gpnp": {        // AKAZE_GPNP 策略
-      "template_path": "data/模板/akaze_template.png",
-      "template_real_width_mm": 200.0,
-      "template_real_height_mm": 200.0,
-      "scale": 0.5,        // AKAZE 图像缩放因子
-      "gpnp_min_pts": 4,   // GPNP 最少匹配点数
-      "use_initial_pnp": true
-    },
-    "binary_corner": {     // BinaryCorner 策略
-      "corners": 10,       // 目标角点数
-      "kernel_size": 3,
-      "corner_scale": 0.5,
-      "target_width": 200,
-      "target_height": 200,
-      "pixel_to_meter_scale": 0.001,
-      "roi_pad_pixels": 3,  // ROI 外扩像素
-      "otsu_ratio": 0.5,
-      "template_dir": "data/NewMuBan/"
-    },
-    "tiny_target": {       // TinyTarget 策略
-      "target_width": 40,
-      "target_height": 40,
-      "scale_factor": 4.0,  // 超分辨率放大倍率
-      "square_size_m": 0.05,// 正方形边长 (米)
-      "roi_pad_pixels": 5,
-      "template_dir": "data/小图/"
-    }
-  },
-  "yolo": {                // YOLO 目标检测
-    "model_path": "best.onnx",
-    "conf_threshold": 0.5,
-    "target_class_id": 0,
-    "roi_expand_ratio": 0.1,
-    "roi_min_size": 100
-  },
   "input": {
-    "left": "data/left.png",
-    "right": "data/right.png"
+    "left": "data/delivery_area_2l/im0.png",
+    "right": "data/delivery_area_2l/im1.png"
   },
   "output": {
     "visualize": true
+  },
+  "camera": {
+    "fx": 541.764,
+    "fy": 541.764,
+    "cx": 553.682,
+    "cy": 232.397,
+    "baseline_mm": 60.0
+  },
+  "yolo": {
+    "model_path": "best.onnx",
+    "conf_threshold": 0.5,
+    "target_class_id": 0,
+    "roi_expand_ratio": 0.0,
+    "roi_min_size": 0
+  },
+  "manual_roi": {
+    "_comment": "设为 true 则跳过 YOLO，直接使用下方 ROI",
+    "enabled": true,
+    "left":  { "x": 416, "y": 113, "width": 300, "height": 300 },
+    "right": { "x": 410, "y": 113, "width": 300, "height": 300 }
+  },
+  "strategies": {
+    "_comment": "ROI 面积阈值: ≤ tiny_max → TinyTarget, ≥ akaze_min → AKAZE, else BinaryCorner",
+    "akaze_min_area": 40001,
+    "tiny_max_area": 800,
+    "akaze_gpnp": {
+      "template_path": "data/delivery_area_2l/im0 - 副本.png",
+      "template_real_width_mm": 500.0,
+      "template_real_height_mm": 500.0,
+      "scale": 0.5,
+      "gpnp_min_pts": 4,
+      "use_initial_pnp": true
+    },
+    "binary_corner": {
+      "template_dir": "data/NewMuBan(reordered)",
+      "corners": 10,
+      "kernel_size": 3,
+      "corner_scale": 3.0,
+      "target_width": 100,
+      "target_height": 100,
+      "pixel_to_meter_scale": 0.004,
+      "roi_pad_pixels": 3,
+      "otsu_ratio": 1
+    },
+    "tiny_target": {
+      "template_dir": "data/NewMuBan(reordered)",
+      "target_width": 50,
+      "target_height": 50,
+      "scale_factor": 4,
+      "square_size_m": 0.2,
+      "roi_pad_pixels": 5
+    }
   }
 }
 ```
+
+关键配置项说明：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `strategies.akaze_min_area` | 40001 | ROI ≥ 此值时选择 AKAZE_GPNP 策略 |
+| `strategies.tiny_max_area` | 800 | ROI ≤ 此值时选择 TinyTarget 策略 |
+| `manual_roi.enabled` | `true` | 设为 `true` 跳过 YOLO 检测，直接使用硬编码 ROI |
 
 ---
 
@@ -526,10 +534,11 @@ GPNP 输出位姿需通过以下全部校验：
 ### 编译
 
 ```bash
-git clone https://github.com/Chihaya-anon343/Steretracker.git
-cd Steretracker
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
+git clone https://github.com/Chihaya-anon343/NEW_Steretracker.git
+cd NEW_Steretracker
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --config Release
 ```
 
 ### 运行
@@ -557,65 +566,64 @@ cmake --build build --config Release
 
 ```
 Steretracker/
-├── README.md                          # 项目说明（本文件）
-├── PORTING_REPORT.md                  # Python→C++ 移植报告
-├── FEATURE_EXTRACTION_SPEC.md         # 特征提取策略详细设计文档
-├── CMakeLists.txt                     # CMake 构建配置
-├── main.cpp                           # 程序入口（YOLO + 策略分发 + 逐帧循环）
-├── best.onnx                          # YOLO ONNX 模型
+├── README.md
+├── PORTING_REPORT.md
+├── FEATURE_EXTRACTION_SPEC.md
+├── CMakeLists.txt
+├── main.cpp                    # 程序入口（YOLO + ROI 获取 + 调用 StereoTracker）
+├── best.onnx                   # YOLO ONNX 模型
 │
 ├── config/
-│   └── tracker_config.json            # 默认配置文件
+│   └── tracker_config.json     # 默认配置文件
 │
-├── data/                              # 测试图像与模板
-│   ├── 大图/                          # AKAZE 场景
-│   ├── 中图/                          # BinaryCorner 场景
-│   ├── 小图/                          # TinyTarget 场景
-│   ├── NewMuBan/                      # BinaryCorner 模板库
+├── data/
+│   ├── 大图/                   # AKAZE 场景
+│   ├── 中图/                   # BinaryCorner 场景
+│   ├── 小图/                   # TinyTarget 场景
+│   ├── NewMuBan/               # BinaryCorner 模板库
 │   ├── NewMuBan(reordered)/
 │   └── rotated/
 │
 ├── include/
 │   ├── common/
-│   │   ├── Types.hpp                  # 12 个强类型结构体
-│   │   ├── Config.hpp                 # 配置校验与工厂函数
-│   │   └── GeometryUtils.hpp          # 几何工具函数 (inline)
+│   │   ├── Types.hpp           # 12 个强类型结构体
+│   │   ├── Config.hpp          # 配置校验与工厂函数
+│   │   └── GeometryUtils.hpp   # 几何工具函数 (inline)
 │   ├── detection/
-│   │   ├── YoloDetector.hpp           # ONNX YOLO 推理
-│   │   ├── YoloRoiProvider.hpp        # 检测→ROI 转换 + ROI 配置
-│   │   └── RoiGenerator.hpp           # ROI 生成器接口
+│   │   ├── YoloDetector.hpp    # ONNX YOLO 推理
+│   │   ├── YoloRoiProvider.hpp # 检测→ROI 转换 + ROI 配置
+│   │   └── RoiGenerator.hpp    # ROI 生成器接口
 │   ├── feature/
-│   │   ├── FeatureExtractor.hpp       # 特征提取器抽象基类
-│   │   ├── AkazeGpnpExtractor.hpp     # AKAZE 提取 + 光流 + 投影 + 匹配
-│   │   ├── BinaryCornerExtractor.hpp  # 二值轮廓角点提取
-│   │   ├── TinyTargetExtractor.hpp    # 微小矩形目标角点提取
-│   │   ├── FeatureExtractorFactory.hpp# 策略工厂（按 ROI 面积分发）
-│   │   ├── OpticalFlowTracker.hpp     # LK 光流 + FB 校验
-│   │   └── MadDisparityFilter.hpp     # MAD 视差滤波
+│   │   ├── FeatureExtractor.hpp     # 特征提取器抽象基类
+│   │   ├── AkazeExtractor.hpp       # 纯 AKAZE 提取（无光流/投影）
+│   │   ├── AkazeGpnpExtractor.hpp   # AKAZE 提取 + 光流 + 投影 + 匹配
+│   │   ├── BinaryCornerExtractor.hpp# 二值轮廓角点提取
+│   │   ├── TinyTargetExtractor.hpp  # 微小矩形目标角点提取
+│   │   ├── OpticalFlowTracker.hpp   # LK 光流 + FB 校验
+│   │   └── MadDisparityFilter.hpp   # MAD 视差滤波
 │   ├── matching/
-│   │   └── TemplateMatcher.hpp        # 三阶段模板匹配
-│   ├── stereo/
-│   │   └── StereoProjector.hpp        # 视差→深度→投影
+│   │   └── TemplateMatcher.hpp      # 三阶段模板匹配
 │   ├── pose/
-│   │   ├── InitialPnPSolver.hpp       # RANSAC+ITERATIVE 初始 PnP
-│   │   └── GPnPSolver.hpp            # Eigen LM GPNP 非线性优化
-│   ├── visualization/
-│   │   └── Visualizer.hpp            # 4 面板调试图像
+│   │   ├── InitialPnPSolver.hpp     # RANSAC+ITERATIVE 初始 PnP
+│   │   └── GPnPSolver.hpp           # Eigen LM GPNP 非线性优化
+│   ├── stereo/
+│   │   └── StereoProjector.hpp      # 视差→深度→投影
 │   ├── tracker/
-│   │   └── StereoTracker.hpp         # 协调器（薄封装，~200 行）
+│   │   └── StereoTracker.hpp        # 核心协调器（策略链 + 退化 + PnP 分发）
+│   ├── visualization/
+│   │   └── Visualizer.hpp           # 多面板调试图像
 │   └── utils/
-│       └── Timing.hpp                 # 计时工具
+│       └── PoseUtils.hpp            # 位姿工具函数
 │
-├── src/                               # 对应 .cpp 实现
+├── src/                             # 对应 .cpp 实现
 │   ├── detection/  (YoloDetector + YoloRoiProvider + RoiGenerator)
-│   ├── feature/    (AkazeGpnpExtractor + BinaryCornerExtractor
-│   │                + TinyTargetExtractor + FeatureExtractorFactory
-│   │                + OpticalFlowTracker + MadDisparityFilter)
+│   ├── feature/    (AkazeExtractor + AkazeGpnpExtractor + BinaryCornerExtractor
+│   │                + TinyTargetExtractor + OpticalFlowTracker + MadDisparityFilter)
 │   ├── matching/   (TemplateMatcher)
-│   ├── stereo/     (StereoProjector)
 │   ├── pose/       (InitialPnPSolver + GPnPSolver)
+│   ├── stereo/     (StereoProjector)
+│   ├── tracker/    (StereoTracker)
 │   ├── visualization/ (Visualizer)
-│   └── tracker/    (StereoTracker)
+│   └── utils/      (PoseUtils)
 │
-└── test/
-    └── test_stereo_tracker.cpp         # 单元测试
+└── test/                             # 单元测试（待添加）
