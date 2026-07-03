@@ -48,7 +48,9 @@ inline TrackerConfig makeTrackerConfig(
     int gpnp_min_pts = 4,
     bool use_initial_pnp = true,
     double template_real_width_mm = 200.0,
-    double template_real_height_mm = 200.0)
+    double template_real_height_mm = 200.0,
+    int akaze_min_area = 40000,
+    int tiny_max_area = 800)
 {
     if (scale <= 0.0 || scale > 1.0) {
         throw std::invalid_argument("scale must be in (0, 1], got: " + std::to_string(scale));
@@ -59,6 +61,12 @@ inline TrackerConfig makeTrackerConfig(
     if (template_real_width_mm <= 0.0 || template_real_height_mm <= 0.0) {
         throw std::invalid_argument("Template physical dimensions must be positive");
     }
+    if (akaze_min_area <= 0) {
+        throw std::invalid_argument("akaze_min_area must be positive");
+    }
+    if (tiny_max_area <= 0) {
+        throw std::invalid_argument("tiny_max_area must be positive");
+    }
 
     TrackerConfig cfg;
     cfg.scale = scale;
@@ -66,6 +74,8 @@ inline TrackerConfig makeTrackerConfig(
     cfg.use_initial_pnp = use_initial_pnp;
     cfg.template_real_width_mm = template_real_width_mm;
     cfg.template_real_height_mm = template_real_height_mm;
+    cfg.akaze_min_area = akaze_min_area;
+    cfg.tiny_max_area = tiny_max_area;
     return cfg;
 }
 

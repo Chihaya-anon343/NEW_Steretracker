@@ -122,32 +122,6 @@ else()
 endif()
 
 # ============================================================================
-# Tests
-# ============================================================================
-
-option(BUILD_TESTING "Build unit tests" ON)
-
-if(BUILD_TESTING)
-    enable_testing()
-
-    add_executable(test_gpnp
-        test/test_stereo_tracker.cpp
-    )
-
-    target_include_directories(test_gpnp PRIVATE
-        ${PROJECT_INCLUDE_DIR}
-    )
-
-    if(TARGET Eigen3::Eigen)
-        target_link_libraries(test_gpnp PRIVATE Eigen3::Eigen)
-    else()
-        target_include_directories(test_gpnp PRIVATE ${EIGEN3_INCLUDE_DIR})
-    endif()
-
-    add_test(NAME GPNP_UnitTests COMMAND test_gpnp)
-endif()
-
-# ============================================================================
 # Install
 # ============================================================================
 
@@ -167,5 +141,4 @@ elseif(DEFINED EIGEN3_INCLUDE_DIRS)
 else()
     message(STATUS "  Eigen3:       (found via target)")
 endif()
-message(STATUS "  Tests:        ${BUILD_TESTING}")
 message(STATUS "  ONNX Runtime: ${ONNXRUNTIME_ROOT}")

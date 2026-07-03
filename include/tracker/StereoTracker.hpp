@@ -16,13 +16,24 @@
 
 namespace gpnp {
 
+// Forward declarations for pre-initialized extractors
+class AkazeGpnpExtractor;
+class BinaryCornerExtractor;
+class TinyTargetExtractor;
+
 class StereoTracker {
 public:
+    /// Extended constructor: pre-initializes all three feature extractors.
+    /// Call configureStrategyChain() per-frame to select the active chain.
     StereoTracker(const Eigen::Matrix3d& K,
                   const Eigen::Matrix3d& R_rl,
                   const Eigen::Vector3d& t_rl,
                   const std::string& template_path,
-                  const TrackerConfig& config = makeTrackerConfig());
+                  const TrackerConfig& config,
+                  const BinaryCornerExtractor::Config& binary_cfg,
+                  const std::string& binary_template_dir,
+                  const TinyTargetExtractor::Config& tiny_cfg,
+                  const std::string& tiny_template_dir);
 
     ~StereoTracker();
 
@@ -30,10 +41,12 @@ public:
     StereoTracker& operator=(const StereoTracker&) = delete;
 
     // ========================================================================
-    // Public API (0626: added left_roi, right_roi)
+    // Public API
     // ========================================================================
 
     /// Process one stereo frame with optional ROI.
+    /// Automatically selects extraction strategy from ROI area and expands
+    /// ROI with padding when using non-AKAZE extractors.
     PipelineResult process(const cv::Mat& left_img,
                            const cv::Mat& right_img,
                            bool visualize = false,
@@ -56,17 +69,7 @@ public:
     const std::vector<LogEntry>& getLogs() const;
     void printLogs() const;
 
-    /// Replace the primary feature extraction strategy at runtime.
-    void setExtractor(std::unique_ptr<FeatureExtractor> extractor);
-
-    /// Add a fallback feature extractor. Fallbacks are tried in order of registration
-    /// when the primary extractor (or a higher-priority fallback) fails.
-    void addFallbackExtractor(std::unique_ptr<FeatureExtractor> extractor);
-
-    /// Clear all registered fallback extractors (for per-frame re-registration).
-    void clearFallbackExtractors();
-
-    /// Set output directory for visualization images (created by main.cpp).
+    /// Set output directory for visualization images.
     void setOutputDir(const std::string& dir) { output_dir_ = dir; }
 
     const StereoCameraParams& cameraParams() const { return camera_; }
@@ -79,18 +82,39 @@ private:
     TrackerConfig config_;
     TemplateData template_;
 
+    // ========================================================================
+    // Pre-initialized extractors (created once in constructor, reused every frame)
+    // ========================================================================
+    std::unique_ptr<AkazeGpnpExtractor> akaze_extractor_;
+    std::unique_ptr<BinaryCornerExtractor> binary_extractor_;
+    std::unique_ptr<TinyTargetExtractor> tiny_extractor_;
+
+    /// Active primary extractor (points to one of the three above).
+    FeatureExtractor* extractor_ = nullptr;
+
+    /// Active fallback chain (pointers into the three above, in order).
+    std::vector<FeatureExtractor*> fallback_extractors_;
+
+    // Strategy selection thresholds (read from config)
+    int akaze_min_area_ = 40000;
+    int tiny_max_area_  = 800;
+
+    // ROI padding for non-AKAZE extractors
+    int binary_roi_pad_ = 0;
+    int tiny_roi_pad_   = 0;
+
+    std::string output_dir_;
+
     // Subsystem modules
-    std::unique_ptr<FeatureExtractor> extractor_;  ///< Feature extraction strategy
-    std::string output_dir_;                       ///< Visualization output directory
     InitialPnPSolver initial_pnp_;
     GPnPSolver gpnp_solver_;
-    MadDisparityFilter mad_filter_;        // 0626: MAD extracted to separate class
+    MadDisparityFilter mad_filter_;
     std::unique_ptr<Visualizer> visualizer_;
 
     TrackingState state_;
 
     // ========================================================================
-    // ROI Helpers (0626)
+    // ROI Helpers
     // ========================================================================
 
     static RoiRect validateRoi(const RoiRect* roi, const cv::Size& img_size,
@@ -109,18 +133,18 @@ private:
     static std::pair<cv::Mat, cv::Mat> loadImage(const cv::Mat& img);
 
     // ========================================================================
-    // Degradation: fallback extraction chain
-    // ========================================================================
-
-    /// Fallback extractors, tried in registration order when primary fails.
-    std::vector<std::unique_ptr<FeatureExtractor>> fallback_extractors_;
-
-    // ========================================================================
     // Degradation helpers
     // ========================================================================
 
+    /// Configure the active extraction chain based on ROI area (called automatically by process()).
+    void configureStrategyChain(int roi_area);
+
+    /// Expand ROI with padding when using non-AKAZE extractors for corner context.
+    void applyRoiPadding(RoiRect& rl, RoiRect& rr, int roi_area,
+                         int left_cols, int left_rows,
+                         int right_cols, int right_rows) const;
+
     /// Run extraction + coordinate restore for one extractor on pre-cropped ROIs.
-    /// Returns true if extraction produced meaningful results.
     bool runExtraction(FeatureExtractor& ext,
                        const cv::Mat& left_gray, const cv::Mat& right_gray,
                        const cv::Mat& left_color, const cv::Mat& right_color,
@@ -141,23 +165,13 @@ private:
     // PnP dispatch — strategy-specific pose estimation
     // ========================================================================
 
-    /// Dispatch PnP based on strategy type, returning {ok, pose}.
     std::pair<bool, PoseEstimate> dispatchPnP(FeatureExtractor* ext,
                                                PipelineResult& result, bool is_first);
 
-    /// Run AKAZE path PnP (MAD pre-filtered data assumed).
-    /// Returns {ok, pose}. If is_first && InitialPnP succeeded but GPNP failed,
-    /// returns {true, InitialPnP_pose} — do NOT degrade.
     std::pair<bool, PoseEstimate> runAkazePnP(PipelineResult& result, bool is_first);
-
-    /// Run BinaryCorner path PnP.
-    /// Returns {ok, pose}. Same InitialPnP fallback semantics as AKAZE.
     std::pair<bool, PoseEstimate> runBinaryCornerPnP(PipelineResult& result, bool is_first);
-
-    /// Run TinyTarget path PnP (cv::solvePnP).
     std::pair<bool, PoseEstimate> runTinyTargetPnP(PipelineResult& result);
 
-    /// Merge a successful pose into final PipelineResult and update tracking state.
     void finalizePose(PipelineResult& result, const PoseEstimate& pose);
 
     // ========================================================================

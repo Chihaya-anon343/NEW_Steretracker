@@ -52,6 +52,8 @@ struct TrackerConfig {
     double template_real_width_mm{200.0}; ///< Template physical width (mm)
     double template_real_height_mm{200.0};///< Template physical height (mm)
     LKParams lk_params;                  ///< Optical flow parameters
+    int akaze_min_area{40000};           ///< Min ROI area to select AKAZE strategy
+    int tiny_max_area{800};              ///< Max ROI area for TinyTarget strategy
 };
 
 // ============================================================================

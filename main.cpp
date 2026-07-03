@@ -130,7 +130,8 @@ int main(int argc, char** argv) {
     Eigen::Matrix3d R_rl = Eigen::Matrix3d::Identity();
     Eigen::Vector3d t_rl(baseline, 0.0, 0.0);
 
-    TrackerConfig tracker_cfg = makeTrackerConfig(scale, min_pts, use_init_pnp, tw, th);
+    TrackerConfig tracker_cfg = makeTrackerConfig(scale, min_pts, use_init_pnp, tw, th,
+                                                  akaze_min_area, tiny_max_area);
 
     try {
         // 加载双目图像
@@ -148,9 +149,11 @@ int main(int argc, char** argv) {
         RoiGenerator::Config roi_cfg{target_cls, expand, min_roi};
         bool yolo_ok = yolo.initialize(yolo_cfg, roi_cfg);
 
-        // 初始化 StereoTracker（默认使用 AKAZE 策略）
-        std::cout << "初始化 StereoTracker..." << std::endl;
-        StereoTracker tracker(K, R_rl, t_rl, template_path, tracker_cfg);
+        // 初始化 StereoTracker（预创建全部 3 种策略，每帧仅切换指针）
+        std::cout << "初始化 StereoTracker（预加载 3 种提取器）..." << std::endl;
+        StereoTracker tracker(K, R_rl, t_rl, template_path, tracker_cfg,
+                              binary_cfg, binary_template_dir,
+                              tiny_cfg, tiny_template_dir);
         tracker.setOutputDir(output_dir);
 
         // ====================================================================
@@ -171,61 +174,7 @@ int main(int argc, char** argv) {
                 std::tie(rl, rr) = yolo.detect(left_img, right_img);
             }
 
-            // 根据 ROI 面积选择特征提取策略
-            int roi_area = rl.valid() ? rl.width * rl.height : 0;
-
-            // Clear previous frame's fallbacks
-            tracker.clearFallbackExtractors();
-
-            if (roi_area >= akaze_min_area || roi_area == 0) {
-                // Large ROI or no detection → AKAZE primary
-                auto akaze = std::make_unique<AkazeGpnpExtractor>(
-                    scale, tracker_cfg.lk_params);
-                tracker.setExtractor(std::move(akaze));
-
-                // Fallback chain: AKAZE → BinaryCorner → TinyTarget
-                auto fb_bc = std::make_unique<BinaryCornerExtractor>(
-                    binary_cfg, binary_template_dir);
-                tracker.addFallbackExtractor(std::move(fb_bc));
-                auto fb_tt = std::make_unique<TinyTargetExtractor>(
-                    tiny_cfg, tiny_template_dir);
-                tracker.addFallbackExtractor(std::move(fb_tt));
-            } else if (roi_area > tiny_max_area) {
-                // Medium ROI → BinaryCorner primary
-                auto bc = std::make_unique<BinaryCornerExtractor>(
-                    binary_cfg, binary_template_dir);
-                tracker.setExtractor(std::move(bc));
-
-                // Fallback chain: BinaryCorner → TinyTarget
-                auto fb_tt = std::make_unique<TinyTargetExtractor>(
-                    tiny_cfg, tiny_template_dir);
-                tracker.addFallbackExtractor(std::move(fb_tt));
-            } else {
-                // Small ROI → TinyTarget primary (no further fallback)
-                auto tt = std::make_unique<TinyTargetExtractor>(
-                    tiny_cfg, tiny_template_dir);
-                tracker.setExtractor(std::move(tt));
-            }
-
-            // 非 AKAZE 策略：按配置扩大 ROI，给角点提取提供周围上下文
-            {
-                int pad = (roi_area > 0 && roi_area <= tiny_max_area)     ? tiny_cfg.roi_pad_pixels
-                        : (roi_area > tiny_max_area && roi_area < akaze_min_area)  ? binary_cfg.roi_pad_pixels
-                        : 0;
-                if (pad > 0 && rl.valid()) {
-                    rl = RoiRect{std::max(0, rl.x - pad),
-                                 std::max(0, rl.y - pad),
-                                 std::min(left_img.cols - std::max(0, rl.x - pad), rl.width  + 2*pad),
-                                 std::min(left_img.rows - std::max(0, rl.y - pad), rl.height + 2*pad)};
-                }
-                if (pad > 0 && rr.valid()) {
-                    rr = RoiRect{std::max(0, rr.x - pad),
-                                 std::max(0, rr.y - pad),
-                                 std::min(right_img.cols - std::max(0, rr.x - pad), rr.width  + 2*pad),
-                                 std::min(right_img.rows - std::max(0, rr.y - pad), rr.height + 2*pad)};
-                }
-            }
-
+            // process() 内部自动完成：策略链选择 + ROI padding + 提取 + 位姿解算
             const RoiRect* pl = (rl.valid()) ? &rl : nullptr;
             const RoiRect* pr = (rr.valid()) ? &rr : nullptr;
 

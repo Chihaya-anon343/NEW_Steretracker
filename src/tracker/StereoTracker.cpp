@@ -18,70 +18,120 @@
 namespace gpnp {
 
 // ============================================================================
-// 构造与初始化 —— 创建默认 AKAZE 提取器，加载模板特征
+// 构造与初始化 —— 预创建所有三种特征提取器，加载模板
 // ============================================================================
 
 StereoTracker::StereoTracker(const Eigen::Matrix3d& K,
                                const Eigen::Matrix3d& R_rl,
                                const Eigen::Vector3d& t_rl,
                                const std::string& template_path,
-                               const TrackerConfig& config)
+                               const TrackerConfig& config,
+                               const BinaryCornerExtractor::Config& binary_cfg,
+                               const std::string& binary_template_dir,
+                               const TinyTargetExtractor::Config& tiny_cfg,
+                               const std::string& tiny_template_dir)
     : camera_(makeStereoCameraParams(K, R_rl, t_rl))
     , config_(config)
     , initial_pnp_(config.gpnp_min_pts)
     , gpnp_solver_(camera_, config.gpnp_min_pts)
-    , mad_filter_(3, 3.0)   // 0626: min_pts=3, mad_factor=3.0
+    , mad_filter_(3, 3.0)
     , visualizer_(nullptr)
 {
-    // Create default AKAZE extractor and init camera params
-    auto akaze = std::make_unique<AkazeGpnpExtractor>(config.scale, config.lk_params);
-    akaze->initCamera(camera_);
+    // ---- ① 预初始化 AKAZE 提取器（主策略，模板加载较慢）----
+    akaze_extractor_ = std::make_unique<AkazeGpnpExtractor>(config.scale, config.lk_params);
+    akaze_extractor_->initCamera(camera_);
+    akaze_extractor_->setTemplateData(template_path,
+                                      config.template_real_width_mm,
+                                      config.template_real_height_mm);
+    template_ = akaze_extractor_->templateData();
 
-    // Load template via the extractor
-    akaze->setTemplateData(template_path,
-                           config.template_real_width_mm,
-                           config.template_real_height_mm);
-    template_ = akaze->templateData();
+    // ---- ② 预初始化 BinaryCorner 提取器（加载 24 个角度模板）----
+    binary_extractor_ = std::make_unique<BinaryCornerExtractor>(binary_cfg, binary_template_dir);
 
-    extractor_ = std::move(akaze);
+    // ---- ③ 预初始化 TinyTarget 提取器（加载多角度模板）----
+    tiny_extractor_ = std::make_unique<TinyTargetExtractor>(tiny_cfg, tiny_template_dir);
+
+    // ---- ④ 从 config 读取策略选择阈值 ----
+    akaze_min_area_ = config.akaze_min_area;
+    tiny_max_area_  = config.tiny_max_area;
+
+    // ---- ④+ 存储 ROI padding 值（用于非 AKAZE 策略时扩大 ROI）----
+    binary_roi_pad_ = binary_cfg.roi_pad_pixels;
+    tiny_roi_pad_   = tiny_cfg.roi_pad_pixels;
+
+    // ---- ⑤ 默认策略链：AKAZE → BinaryCorner → TinyTarget ----
+    extractor_ = akaze_extractor_.get();
+    fallback_extractors_.push_back(binary_extractor_.get());
+    fallback_extractors_.push_back(tiny_extractor_.get());
+
+    std::cout << "[StereoTracker] Pre-initialized 3 extractors: AkazeGpnp, BinaryCorner, TinyTarget"
+              << std::endl;
 }
 
 StereoTracker::~StereoTracker() = default;
 
 // ============================================================================
-// 策略切换 —— 根据 ROI 面积动态更换特征提取器
+// 策略链配置 —— 根据 ROI 面积选择活跃的主提取器和退化链（仅修改指针，零开销）
 // ============================================================================
 
-void StereoTracker::setExtractor(std::unique_ptr<FeatureExtractor> extractor) {
-    if (!extractor) return;
-
-    // AKAZE-based extractors need camera init + cached template data.
-    // Inject both here so callers (main.cpp) don't need to re-extract.
-    if (auto* akaze = dynamic_cast<AkazeGpnpExtractor*>(extractor.get())) {
-        akaze->initCamera(camera_);
-        akaze->setTemplateData(template_);  // use cached TemplateData (no re-extraction)
-    }
-
-    extractor_ = std::move(extractor);
-    std::cout << "[StereoTracker] Switched to extractor: "
-              << extractor_->name() << std::endl;
-}
-
-void StereoTracker::addFallbackExtractor(std::unique_ptr<FeatureExtractor> extractor) {
-    if (!extractor) return;
-
-    // Inject camera parameters for AKAZE-based fallbacks (if any)
-    if (auto* akaze = dynamic_cast<AkazeGpnpExtractor*>(extractor.get())) {
-        akaze->initCamera(camera_);
-    }
-
-    std::cout << "[StereoTracker] Registered fallback extractor: "
-              << extractor->name() << std::endl;
-    fallback_extractors_.push_back(std::move(extractor));
-}
-
-void StereoTracker::clearFallbackExtractors() {
+void StereoTracker::configureStrategyChain(int roi_area) {
     fallback_extractors_.clear();
+
+    if (roi_area >= akaze_min_area_ || roi_area == 0) {
+        // Large ROI or no detection → AKAZE → BinaryCorner → TinyTarget
+        extractor_ = akaze_extractor_.get();
+        fallback_extractors_.push_back(binary_extractor_.get());
+        fallback_extractors_.push_back(tiny_extractor_.get());
+
+        std::cout << "[StereoTracker] Strategy chain: AkazeGpnp → BinaryCorner → TinyTarget"
+                  << " (roi_area=" << roi_area << ")" << std::endl;
+
+    } else if (roi_area > tiny_max_area_) {
+        // Medium ROI → BinaryCorner → TinyTarget
+        extractor_ = binary_extractor_.get();
+        fallback_extractors_.push_back(tiny_extractor_.get());
+
+        std::cout << "[StereoTracker] Strategy chain: BinaryCorner → TinyTarget"
+                  << " (roi_area=" << roi_area << ")" << std::endl;
+
+    } else {
+        // Small ROI → TinyTarget only (no further fallback)
+        extractor_ = tiny_extractor_.get();
+        // fallback_extractors_ remains empty
+
+        std::cout << "[StereoTracker] Strategy chain: TinyTarget only"
+                  << " (roi_area=" << roi_area << ")" << std::endl;
+    }
+}
+
+// ============================================================================
+// ROI padding —— 非 AKAZE 策略时扩大 ROI 给角点提取提供周围上下文
+// ============================================================================
+
+void StereoTracker::applyRoiPadding(RoiRect& rl, RoiRect& rr, int roi_area,
+                                    int left_cols, int left_rows,
+                                    int right_cols, int right_rows) const {
+    // Only pad when using non-AKAZE strategies (i.e., when roi_area != 0 and < akaze_min_area)
+    if (roi_area == 0 || roi_area >= akaze_min_area_)
+        return;
+
+    int pad = (roi_area <= tiny_max_area_) ? tiny_roi_pad_
+             : (roi_area < akaze_min_area_) ? binary_roi_pad_
+             : 0;
+    if (pad <= 0) return;
+
+    if (rl.valid()) {
+        rl = RoiRect{std::max(0, rl.x - pad),
+                     std::max(0, rl.y - pad),
+                     std::min(left_cols - std::max(0, rl.x - pad), rl.width  + 2 * pad),
+                     std::min(left_rows - std::max(0, rl.y - pad), rl.height + 2 * pad)};
+    }
+    if (rr.valid()) {
+        rr = RoiRect{std::max(0, rr.x - pad),
+                     std::max(0, rr.y - pad),
+                     std::min(right_cols - std::max(0, rr.x - pad), rr.width  + 2 * pad),
+                     std::min(right_rows - std::max(0, rr.y - pad), rr.height + 2 * pad)};
+    }
 }
 
 // ============================================================================
@@ -98,8 +148,6 @@ bool StereoTracker::runExtraction(FeatureExtractor& ext,
 
     // Restore full-image coordinates
     {
-        // Need to call offsetResultToOriginal by hand since it's a member function
-        // We replicate the logic inline
         double lx = left_offset.x, ly = left_offset.y;
         double rx = right_offset.x, ry = right_offset.y;
 
@@ -231,7 +279,7 @@ std::pair<bool, PoseEstimate> StereoTracker::runAkazePnP(PipelineResult& result,
                 // GPNP failed but InitialPnP succeeded → use InitialPnP (no degradation)
                 std::cout << "  [AKAZE] GPNP failed, falling back to InitialPnP result" << std::endl;
                 pose = init_pose;
-                pose.success = true;  // Ensure it's treated as success
+                pose.success = true;
             }
         } else {
             // InitialPnP failed → try GPNP with default depth
@@ -239,7 +287,6 @@ std::pair<bool, PoseEstimate> StereoTracker::runAkazePnP(PipelineResult& result,
             Eigen::Matrix3d R_id = Eigen::Matrix3d::Identity();
             Eigen::Vector3d t_id(0, 0, 5000);
             pose = gpnp_solver_.solve(result, pnp_pts_3d, &R_id, &t_id, gpnp_timing);
-            // If GPNP also fails → return failure → will degrade
         }
     } else if (is_first && !config_.use_initial_pnp) {
         std::cout << "  [InitialPnP] Skipped (use_initial_pnp=false)" << std::endl;
@@ -450,10 +497,20 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
     cv::Mat left_color_orig = left_color.clone();
     cv::Mat right_color_orig = right_color.clone();
 
-    // ---- ROI validation & cropping ----
+    // ---- ROI validation & strategy selection ----
     RoiRect roi_l = validateRoi(left_roi, left_gray.size(), "Left ROI");
     RoiRect roi_r = validateRoi(right_roi, right_gray.size(), "Right ROI");
 
+    // Automatically select extraction strategy chain from ROI area
+    int roi_area = roi_l.valid() ? roi_l.width * roi_l.height : 0;
+    configureStrategyChain(roi_area);
+
+    // Expand ROI with padding for non-AKAZE extractors (corner context)
+    applyRoiPadding(roi_l, roi_r, roi_area,
+                    left_gray.cols, left_gray.rows,
+                    right_gray.cols, right_gray.rows);
+
+    // ---- Cropping (with possibly expanded ROI) ----
     cv::Point2d left_offset(0.0, 0.0), right_offset(0.0, 0.0);
     cv::Mat left_cropped  = left_gray;
     cv::Mat right_cropped = right_gray;
@@ -473,28 +530,20 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
 
     bool is_first = !state_.has_cache;
     PipelineResult result;
-    std::string winning_strategy;    // which strategy succeeded (for visualization)
+    std::string winning_strategy;
     bool fallback_used = false;
     bool pose_ok = false;
     PoseEstimate final_pose;
 
     // ========================================================================
     // Build the degradation chain dynamically
-    //
-    // Chain ordering (higher-precision first):
-    //   Akaze → BinaryCorner → TinyTarget
-    //
-    // The primary extractor (extractor_) is always tried first.
-    // Fallbacks in fallback_extractors_ must be ordered: the chain skips
-    // any strategy that matches the primary type (no duplicate), then
-    // tries the rest in order.
     // ========================================================================
 
     // Collect all candidates: [primary, fallback[0], fallback[1], ...]
     std::vector<FeatureExtractor*> chain;
-    chain.push_back(extractor_.get());
-    for (auto& fb : fallback_extractors_)
-        chain.push_back(fb.get());
+    chain.push_back(extractor_);
+    for (auto* fb : fallback_extractors_)
+        chain.push_back(fb);
 
     // Remove duplicates: if a fallback's type matches primary, skip it
     StrategyType primary_type = extractor_->strategyType();
@@ -513,7 +562,6 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
 
         if (is_fb) {
             fallback_used = true;
-            // Determine what we're degrading from
             std::string from = chain[i - 1]->name();
             std::cout << "[Degradation] " << from << " failed → " << strategy_name << std::endl;
         }
@@ -539,8 +587,6 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
             final_pose = pose;
             winning_strategy = strategy_name;
             break;
-        } else if (!is_fb) {
-            // Primary PnP failed — degradation info already printed above
         }
     }
 
@@ -615,9 +661,8 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
 
             // --- Panel 0: 二值图像（左 | 右），角点叠加 (BinaryCorner only) ---
             if (!is_tiny) {
-                auto* bce = dynamic_cast<BinaryCornerExtractor*>(fallback_extractors_.empty()
-                    ? nullptr : fallback_extractors_[0].get());
-                if (!bce) bce = dynamic_cast<BinaryCornerExtractor*>(extractor_.get());
+                // Use pre-initialized extractor for debug state
+                auto* bce = binary_extractor_.get();
                 if (bce) {
                     cv::Mat bl_bgr, br_bgr;
                     cv::cvtColor(bce->lastLeftBinary(),  bl_bgr, cv::COLOR_GRAY2BGR);
@@ -644,9 +689,7 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
 
             // --- Panel 0b: 旋转回正二值图 (BinaryCorner only) ---
             if (!is_tiny) {
-                auto* bce = dynamic_cast<BinaryCornerExtractor*>(fallback_extractors_.empty()
-                    ? nullptr : fallback_extractors_[0].get());
-                if (!bce) bce = dynamic_cast<BinaryCornerExtractor*>(extractor_.get());
+                auto* bce = binary_extractor_.get();
                 if (bce && !bce->lastUprightBinary().empty()) {
                     cv::Mat up;
                     cv::cvtColor(bce->lastUprightBinary(), up, cv::COLOR_GRAY2BGR);
@@ -680,9 +723,7 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
                     cv::circle(p2_l, cv::Point(static_cast<int>(pv.x), static_cast<int>(pv.y)),
                                1, CORNER_COLORS[i % 10], -1);
                 }
-                auto* bce = dynamic_cast<BinaryCornerExtractor*>(fallback_extractors_.empty()
-                    ? nullptr : fallback_extractors_[0].get());
-                if (!bce) bce = dynamic_cast<BinaryCornerExtractor*>(extractor_.get());
+                auto* bce = binary_extractor_.get();
                 const TemplateData* matched_tmpl = bce ? bce->lastMatchedTemplate() : nullptr;
                 cv::Mat p2_tmpl;
                 if (matched_tmpl) {
@@ -915,7 +956,7 @@ void StereoTracker::offsetResultToOriginal(PipelineResult& result,
     offset_left(result.pts_left_good);
     offset_left(result.pts_left_used);
     offset_left(result.pts_left_match);
-    offset_left(result.pts_right_projected); // projected points are in left image
+    offset_left(result.pts_right_projected);
 
     // Offset right-image coordinate arrays
     auto offset_right = [rx, ry](std::vector<cv::Point2f>& arr) {
@@ -999,35 +1040,56 @@ void StereoTracker::printLogs() const {
         for (const auto& log : logs)
             if (auto it = log.timing.find(k); it != log.timing.end() && it->second > 0.0)
                 { used_keys.push_back(k); break; }
-    if (std::find(used_keys.begin(), used_keys.end(), "gpnp") == used_keys.end())
-        used_keys.push_back("gpnp");
 
-    int n_frames = static_cast<int>(logs.size());
-    std::string sep(150, '=');
-    std::cout << "\n" << sep << "\n                     StereoTracker Log (" << n_frames << " frames)\n" << sep << "\n";
+    std::vector<size_t> widths = {5, 12, 8, 8, 8, 10, 8, 10, 10};
+    for (const auto& k : used_keys) widths.push_back(10);
 
-    std::ostringstream h1, h2;
-    h1 << std::setw(4) << "Frm | " << std::setw(10) << "Type | " << std::setw(7) << "Feat | "
-       << std::setw(6) << "Match | " << std::setw(6) << "Proj | " << std::setw(7) << "Templ | "
-       << std::setw(6) << "GPNP | " << std::setw(8) << "Disp";
-    for (const auto& k : used_keys) h1 << " | " << std::setw(7) << (timing_labels.count(k) ? timing_labels.at(k) : k);
-    h1 << " | " << std::setw(8) << "Total";
-    std::cout << h1.str() << "\n" << std::string(150, '-') << "\n";
+    auto print_sep = [&](char c) {
+        std::cout << "+";
+        for (auto w : widths) std::cout << std::string(w, c) << "+";
+        std::cout << std::endl;
+    };
+    auto print_row = [&](const std::vector<std::string>& cols) {
+        std::cout << "|";
+        for (size_t i = 0; i < cols.size() && i < widths.size(); ++i)
+            std::cout << std::setw(static_cast<int>(widths[i])) << cols[i] << "|";
+        std::cout << std::endl;
+    };
+
+    print_sep('-');
+    std::vector<std::string> header = {"Fr#", "Timestamp", "1st", "FB", "nKp", "nMatch",
+                                        "nProj", "nTmpl", "Disp(px)", "PnP"};
+    for (const auto& k : used_keys) {
+        auto it = timing_labels.find(k);
+        header.push_back(it != timing_labels.end() ? it->second : k);
+    }
+    print_row(header);
+    print_sep('-');
 
     for (const auto& log : logs) {
-        std::ostringstream row;
-        row << std::setw(4) << log.frame << " | " << std::setw(10) << (log.is_first ? "FullAKAZE" : "AKAZE+Flow")
-            << " | " << std::setw(7) << log.n_kp_left << " | " << std::setw(6) << log.n_matched
-            << " | " << std::setw(6) << log.n_projected << " | " << std::setw(7) << log.n_template_match
-            << " | " << std::setw(6) << (log.gpnp_success ? std::to_string(log.gpnp_n_pts)+"pts" : "FAIL")
-            << " | " << std::setw(8) << std::fixed << std::setprecision(1) << log.disparity_median;
-        for (const auto& k : used_keys)
-            row << " | " << std::setw(7) << std::fixed << std::setprecision(1)
-                << (log.timing.count(k) ? log.timing.at(k) : 0.0);
-        row << " | " << std::setw(8) << std::fixed << std::setprecision(1) << log.total_time_ms;
-        std::cout << row.str() << "\n";
+        std::vector<std::string> row;
+        row.push_back(std::to_string(log.frame));
+        std::ostringstream ts; ts << std::fixed << std::setprecision(3) << log.timestamp;
+        row.push_back(ts.str());
+        row.push_back(log.is_first ? "Y" : "N");
+        row.push_back(log.fallback_used ? "Y" : "N");
+        row.push_back(std::to_string(log.n_kp_left));
+        row.push_back(std::to_string(log.n_matched));
+        row.push_back(std::to_string(log.n_projected));
+        row.push_back(std::to_string(log.n_template_match));
+        std::ostringstream ds; ds << std::fixed << std::setprecision(1) << log.disparity_median;
+        row.push_back(ds.str());
+        row.push_back(log.gpnp_success ? "OK" : "FAIL");
+        for (const auto& k : used_keys) {
+            auto it = log.timing.find(k);
+            std::ostringstream ts2;
+            ts2 << std::fixed << std::setprecision(1)
+                << (it != log.timing.end() ? it->second : 0.0);
+            row.push_back(ts2.str());
+        }
+        print_row(row);
     }
-    std::cout << sep << "\n" << std::endl;
+    print_sep('-');
 }
 
 } // namespace gpnp
