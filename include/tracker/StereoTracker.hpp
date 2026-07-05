@@ -14,6 +14,9 @@
 #include <string>
 #include <vector>
 
+#include "feature/BinaryCornerExtractor.hpp"
+#include "feature/TinyTargetExtractor.hpp"
+
 namespace gpnp {
 
 // Forward declarations for pre-initialized extractors
