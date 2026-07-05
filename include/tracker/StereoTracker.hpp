@@ -47,21 +47,22 @@ public:
     // Public API
     // ========================================================================
 
-    /// Process one stereo frame with optional ROI.
+    /// Process one stereo frame with optional ROI group.
     /// Automatically selects extraction strategy from ROI area and expands
     /// ROI with padding when using non-AKAZE extractors.
+    /// When RoiGroup::is_dual is true, delegates to processDualRoi().
     PipelineResult process(const cv::Mat& left_img,
                            const cv::Mat& right_img,
                            bool visualize = false,
-                           const RoiRect* left_roi = nullptr,
-                           const RoiRect* right_roi = nullptr);
+                           const RoiGroup* left_group = nullptr,
+                           const RoiGroup* right_group = nullptr);
 
-    /// Process from file paths with optional ROI.
+    /// Process from file paths with optional ROI group.
     PipelineResult process(const std::string& left_path,
                            const std::string& right_path,
                            bool visualize = false,
-                           const RoiRect* left_roi = nullptr,
-                           const RoiRect* right_roi = nullptr);
+                           const RoiGroup* left_group = nullptr,
+                           const RoiGroup* right_group = nullptr);
 
     void clearCache();
 
@@ -89,6 +90,7 @@ private:
     // Pre-initialized extractors (created once in constructor, reused every frame)
     // ========================================================================
     std::unique_ptr<AkazeGpnpExtractor> akaze_extractor_;
+    std::unique_ptr<AkazeGpnpExtractor> dual_akaze_extractor_;  ///< AKAZE for dual-ROI class 1
     std::unique_ptr<BinaryCornerExtractor> binary_extractor_;
     std::unique_ptr<TinyTargetExtractor> tiny_extractor_;
 
@@ -105,6 +107,11 @@ private:
     // ROI padding for non-AKAZE extractors
     int binary_roi_pad_ = 0;
     int tiny_roi_pad_   = 0;
+
+    // Dual-ROI: precomputed BinaryCorner corners on AKAZE template
+    bool dual_bc_template_ready_{false};
+    std::vector<cv::Point2f> dual_bc_tmpl_corners_;  ///< N=10 corners in template pixel coords
+    std::vector<Eigen::Vector3d> dual_bc_tmpl_pts3d_; ///< 3D coords for each corner
 
     std::string output_dir_;
 
@@ -146,6 +153,17 @@ private:
     void applyRoiPadding(RoiRect& rl, RoiRect& rr, int roi_area,
                          int left_cols, int left_rows,
                          int right_cols, int right_rows) const;
+
+    /// Dual-ROI strategy: BinaryCorner on class 0 (edges) + AKAZE on class 1 (center).
+    /// Merges corners from both extractors and feeds into GPNP.
+    PipelineResult processDualRoi(const cv::Mat& left_img,
+                                   const cv::Mat& right_img,
+                                   const RoiGroup& left_group,
+                                   const RoiGroup& right_group,
+                                   bool visualize);
+
+    /// One-time init: extract BinaryCorner-style corners from AKAZE template.
+    void prepareDualBcTemplate();
 
     /// Run extraction + coordinate restore for one extractor on pre-cropped ROIs.
     bool runExtraction(FeatureExtractor& ext,

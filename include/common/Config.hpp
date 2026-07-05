@@ -50,7 +50,9 @@ inline TrackerConfig makeTrackerConfig(
     double template_real_width_mm = 200.0,
     double template_real_height_mm = 200.0,
     int akaze_min_area = 40000,
-    int tiny_max_area = 800)
+    int tiny_max_area = 800,
+    int dual_roi_secondary_expand = 10,
+    double dual_roi_akaze_scale = 0.5)
 {
     if (scale <= 0.0 || scale > 1.0) {
         throw std::invalid_argument("scale must be in (0, 1], got: " + std::to_string(scale));
@@ -76,6 +78,8 @@ inline TrackerConfig makeTrackerConfig(
     cfg.template_real_height_mm = template_real_height_mm;
     cfg.akaze_min_area = akaze_min_area;
     cfg.tiny_max_area = tiny_max_area;
+    cfg.dual_roi_secondary_expand = dual_roi_secondary_expand;
+    cfg.dual_roi_akaze_scale = dual_roi_akaze_scale;
     return cfg;
 }
 

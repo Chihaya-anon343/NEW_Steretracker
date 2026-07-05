@@ -1,3 +1,8 @@
+/**
+ * @file StereoTracker.cpp
+ * @brief StereoTracker implementation with dual-ROI strategy.
+ */
+
 #include "tracker/StereoTracker.hpp"
 #include "common/GeometryUtils.hpp"
 #include "feature/AkazeGpnpExtractor.hpp"
@@ -14,6 +19,7 @@
 #include <iostream>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace gpnp {
 
@@ -44,6 +50,17 @@ StereoTracker::StereoTracker(const Eigen::Matrix3d& K,
                                       config.template_real_width_mm,
                                       config.template_real_height_mm);
     template_ = akaze_extractor_->templateData();
+
+    // ---- ①+ 预初始化双ROI专用 AKAZE 提取器（独立 scale 参数）----
+    LKParams dual_lk;
+    dual_lk.winSize = cv::Size(15, 15);       // smaller window for small ROI
+    dual_lk.maxLevel = 2;                      // fewer pyramid levels
+    dual_akaze_extractor_ = std::make_unique<AkazeGpnpExtractor>(
+        config.dual_roi_akaze_scale, dual_lk);
+    dual_akaze_extractor_->initCamera(camera_);
+    dual_akaze_extractor_->setTemplateData(template_path,
+                                            config.template_real_width_mm,
+                                            config.template_real_height_mm);
 
     // ---- ② 预初始化 BinaryCorner 提取器（加载 24 个角度模板）----
     binary_extractor_ = std::make_unique<BinaryCornerExtractor>(binary_cfg, binary_template_dir);
@@ -483,8 +500,8 @@ std::pair<bool, PoseEstimate> StereoTracker::dispatchPnP(FeatureExtractor* ext,
 PipelineResult StereoTracker::process(const cv::Mat& left_img,
                                         const cv::Mat& right_img,
                                         bool visualize,
-                                        const RoiRect* left_roi,
-                                        const RoiRect* right_roi) {
+                                        const RoiGroup* left_group,
+                                        const RoiGroup* right_group) {
     ++state_.frame_count;
 
     // ---- Load images ----
@@ -497,9 +514,22 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
     cv::Mat left_color_orig = left_color.clone();
     cv::Mat right_color_orig = right_color.clone();
 
+    // ---- Resolve RoiGroup ----
+    RoiGroup left_grp  = left_group  ? *left_group  : RoiGroup{};
+    RoiGroup right_grp = right_group ? *right_group : RoiGroup{};
+
+    // ---- Dual-ROI path (new strategy placeholder) ----
+    if (left_grp.is_dual && right_grp.is_dual) {
+        return processDualRoi(left_img, right_img, left_grp, right_grp, visualize);
+    }
+
+    // ---- Single-ROI path (existing logic, unchanged) ----
+    RoiRect roi_l = left_grp.primary;
+    RoiRect roi_r = right_grp.primary;
+
     // ---- ROI validation & strategy selection ----
-    RoiRect roi_l = validateRoi(left_roi, left_gray.size(), "Left ROI");
-    RoiRect roi_r = validateRoi(right_roi, right_gray.size(), "Right ROI");
+    roi_l = validateRoi(roi_l.valid() ? &roi_l : nullptr, left_gray.size(), "Left ROI");
+    roi_r = validateRoi(roi_r.valid() ? &roi_r : nullptr, right_gray.size(), "Right ROI");
 
     // Automatically select extraction strategy chain from ROI area
     int roi_area = roi_l.valid() ? roi_l.width * roi_l.height : 0;
@@ -904,11 +934,570 @@ PipelineResult StereoTracker::process(const cv::Mat& left_img,
 PipelineResult StereoTracker::process(const std::string& left_path,
                                         const std::string& right_path,
                                         bool visualize,
-                                        const RoiRect* left_roi,
-                                        const RoiRect* right_roi) {
+                                        const RoiGroup* left_group,
+                                        const RoiGroup* right_group) {
     cv::Mat left = cv::imread(left_path, cv::IMREAD_COLOR);
     cv::Mat right = cv::imread(right_path, cv::IMREAD_COLOR);
-    return process(left, right, visualize, left_roi, right_roi);
+    return process(left, right, visualize, left_group, right_group);
+}
+
+// ============================================================================
+// Dual-ROI Strategy: BinaryCorner (class 0 edges) + AKAZE (class 1 center)
+// ============================================================================
+
+void StereoTracker::prepareDualBcTemplate() {
+    if (dual_bc_template_ready_) return;
+
+    // Get AKAZE template grayscale image
+    const cv::Mat& tmpl_img = akaze_extractor_->templateData().gray_image;
+    if (tmpl_img.empty()) {
+        std::cerr << "[DualRoi] AKAZE template image empty, cannot prepare BC template" << std::endl;
+        dual_bc_template_ready_ = true;  // mark ready to avoid retrying
+        return;
+    }
+
+    int tw = tmpl_img.cols, th = tmpl_img.rows;
+
+    // 1. Otsu binarization
+    cv::Mat binary;
+    cv::threshold(tmpl_img, binary, 0, 255, cv::THRESH_OTSU | cv::THRESH_BINARY);
+
+    // 2. Find largest contour
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (contours.empty()) {
+        std::cerr << "[DualRoi] No contours found in AKAZE template binary" << std::endl;
+        dual_bc_template_ready_ = true;
+        return;
+    }
+
+    auto* largest = &contours[0];
+    for (auto& c : contours) {
+        if (cv::contourArea(c) > cv::contourArea(*largest)) largest = &c;
+    }
+
+    // 3. approxPolyDP with binary search for exactly 10 corners
+    int target_n = binary_extractor_->lastCornersBeforeReorder().empty()
+        ? 10
+        : static_cast<int>(binary_extractor_->lastCornersBeforeReorder().size());
+    if (target_n < 3) target_n = 10;
+
+    double peri = cv::arcLength(*largest, true);
+    double lo = 0.0, hi = peri * 0.1;
+    std::vector<cv::Point2f> corners;
+    for (int iter = 0; iter < 25; ++iter) {
+        double mid = (lo + hi) * 0.5;
+        std::vector<cv::Point2f> approx;
+        cv::approxPolyDP(*largest, approx, mid, true);
+        int sz = static_cast<int>(approx.size());
+        if (sz < target_n) hi = mid;
+        else if (sz > target_n) lo = mid;
+        else { corners = approx; break; }
+    }
+    if (corners.size() != static_cast<size_t>(target_n)) {
+        double eps = (lo + hi) * 0.5;
+        cv::approxPolyDP(*largest, corners, eps, true);
+    }
+
+    if (corners.empty()) {
+        std::cerr << "[DualRoi] Failed to extract corners from AKAZE template" << std::endl;
+        dual_bc_template_ready_ = true;
+        return;
+    }
+
+    // 4. Geometric ordering (CCW from reference angle 0 = up direction)
+    cv::Point2f center(tw / 2.0f, th / 2.0f);
+    auto order = BinaryCornerExtractor::reorderByGeometry(corners, center, 0.0, -1.0);
+    dual_bc_tmpl_corners_.reserve(order.size());
+    for (int idx : order) {
+        dual_bc_tmpl_corners_.push_back(corners[idx]);
+    }
+
+    // 5. Compute 3D coordinates using AKAZE template physical dimensions
+    double real_w = config_.template_real_width_mm;
+    double real_h = config_.template_real_height_mm;
+    dual_bc_tmpl_pts3d_.reserve(dual_bc_tmpl_corners_.size());
+    for (const auto& c : dual_bc_tmpl_corners_) {
+        dual_bc_tmpl_pts3d_.emplace_back(
+            c.x / static_cast<double>(tw) * real_w,
+            c.y / static_cast<double>(th) * real_h,
+            0.0);
+    }
+
+    dual_bc_template_ready_ = true;
+    std::cout << "[DualRoi] BC template prepared: " << dual_bc_tmpl_corners_.size()
+              << " corners on AKAZE template (" << tw << "x" << th << ")"
+              << "  real_size=" << real_w << "x" << real_h << "mm"
+              << std::endl;
+}
+
+PipelineResult StereoTracker::processDualRoi(const cv::Mat& left_img,
+                                               const cv::Mat& right_img,
+                                               const RoiGroup& left_group,
+                                               const RoiGroup& right_group,
+                                               bool visualize) {
+    // 0. Ensure template preprocessing is done
+    prepareDualBcTemplate();
+
+    // ---- Load images ----
+    auto [left_color, left_gray] = loadImage(left_img);
+    auto [right_color, right_gray] = loadImage(right_img);
+    if (left_gray.empty() || right_gray.empty()) {
+        PipelineResult empty;
+        empty.is_first_frame = !state_.has_cache;
+        return empty;
+    }
+
+    cv::Mat left_color_orig = left_color.clone();
+    cv::Mat right_color_orig = right_color.clone();
+
+    int pad = config_.dual_roi_secondary_expand;
+
+    bool is_first = !state_.has_cache;
+
+    // 1. Expand secondary ROI
+    auto expandRoi = [](const RoiRect& roi, int p, int img_w, int img_h) -> RoiRect {
+        int x = std::max(0, roi.x - p);
+        int y = std::max(0, roi.y - p);
+        int w = std::min(img_w - x, roi.width  + 2 * p);
+        int h = std::min(img_h - y, roi.height + 2 * p);
+        return RoiRect{x, y, w, h};
+    };
+
+    RoiRect left_pri  = left_group.primary;
+    RoiRect right_pri = right_group.primary;
+    RoiRect left_sec  = expandRoi(left_group.secondary,  pad, left_img.cols,  left_img.rows);
+    RoiRect right_sec = expandRoi(right_group.secondary, pad, right_img.cols, right_img.rows);
+
+    // Offset from class 1 ROI to class 0 ROI (same for right since both expand uniformly)
+    cv::Point2d sec_to_pri_offset(
+        static_cast<double>(left_sec.x - left_pri.x),
+        static_cast<double>(left_sec.y - left_pri.y));
+    cv::Point2d right_sec_to_pri_offset(
+        static_cast<double>(right_sec.x - right_pri.x),
+        static_cast<double>(right_sec.y - right_pri.y));
+
+    std::cout << "[DualRoi] pad=" << pad
+              << "  primary=" << left_pri.width << "x" << left_pri.height
+              << "  secondary(raw)=" << left_group.secondary.width << "x" << left_group.secondary.height
+              << "  secondary(expanded)=" << left_sec.width << "x" << left_sec.height
+              << "  offset=(" << sec_to_pri_offset.x << "," << sec_to_pri_offset.y << ")"
+              << std::endl;
+
+    // 2. Crop images
+    cv::Mat left_c0_gray   = left_gray(cv::Rect(left_pri.x, left_pri.y, left_pri.width, left_pri.height)).clone();
+    cv::Mat right_c0_gray  = right_gray(cv::Rect(right_pri.x, right_pri.y, right_pri.width, right_pri.height)).clone();
+    cv::Mat left_c0_color  = left_color(cv::Rect(left_pri.x, left_pri.y, left_pri.width, left_pri.height)).clone();
+    cv::Mat right_c0_color = right_color(cv::Rect(right_pri.x, right_pri.y, right_pri.width, right_pri.height)).clone();
+
+    cv::Mat left_c1_gray   = left_gray(cv::Rect(left_sec.x, left_sec.y, left_sec.width, left_sec.height)).clone();
+    cv::Mat right_c1_gray  = right_gray(cv::Rect(right_sec.x, right_sec.y, right_sec.width, right_sec.height)).clone();
+    cv::Mat left_c1_color  = left_color(cv::Rect(left_sec.x, left_sec.y, left_sec.width, left_sec.height)).clone();
+    cv::Mat right_c1_color = right_color(cv::Rect(right_sec.x, right_sec.y, right_sec.width, right_sec.height)).clone();
+
+    // 3. BinaryCorner extraction on class 0 (edge corners, with rotation alignment)
+    PipelineResult result_bc = binary_extractor_->extract(
+        left_c0_gray, right_c0_gray, left_c0_color, right_c0_color);
+
+    int n_bc = static_cast<int>(result_bc.pts_left_match.size());
+    std::cout << "[DualRoi] BinaryCorner on class 0: " << n_bc << " corners" << std::endl;
+
+    // 4. AKAZE extraction on class 1 (center texture features, dual-ROI params)
+    PipelineResult result_ak = dual_akaze_extractor_->extract(
+        left_c1_gray, right_c1_gray, left_c1_color, right_c1_color);
+
+    int m_ak_match = static_cast<int>(result_ak.pts_left_match.size());
+    std::cout << "[DualRoi] AKAZE on class 1: " << m_ak_match << " template matches"
+              << " (kp=" << result_ak.n_kp_left
+              << ", flow=" << result_ak.pts_left_good.size() << ")"
+              << std::endl;
+
+    // 5. Coordinate transform: class-1-ROI-local → class-0-ROI-local
+    auto offsetPoints = [](std::vector<cv::Point2f>& pts, double dx, double dy) {
+        float fx = static_cast<float>(dx), fy = static_cast<float>(dy);
+        for (auto& p : pts) { p.x += fx; p.y += fy; }
+    };
+    offsetPoints(result_ak.pts_left_match,   sec_to_pri_offset.x, sec_to_pri_offset.y);
+    offsetPoints(result_ak.pts_left_good,    sec_to_pri_offset.x, sec_to_pri_offset.y);
+    offsetPoints(result_ak.pts_right_good,   right_sec_to_pri_offset.x, right_sec_to_pri_offset.y);
+    offsetPoints(result_ak.pts_left_used,    sec_to_pri_offset.x, sec_to_pri_offset.y);
+    offsetPoints(result_ak.pts_right_used,   right_sec_to_pri_offset.x, right_sec_to_pri_offset.y);
+    for (auto& kp : result_ak.kp_left) {
+        kp.pt.x += static_cast<float>(sec_to_pri_offset.x);
+        kp.pt.y += static_cast<float>(sec_to_pri_offset.y);
+    }
+
+    // 6. Merge corner sets
+    // Use pts_left_match from both extractors (these have template correspondences)
+    std::vector<cv::Point2f> merged_pts_left, merged_pts_right, merged_pts_template;
+    std::vector<cv::KeyPoint> merged_kp_left;
+    std::vector<Eigen::Vector3d> merged_pts3d;
+
+    // --- BC contribution (N corners, 1:1 left-right-template) ---
+    int n_bc_right = static_cast<int>(result_bc.pts_right_good.size());
+    int n_bc_use = std::min(n_bc, n_bc_right);
+
+    for (int i = 0; i < n_bc_use; ++i) {
+        merged_pts_left.push_back(result_bc.pts_left_match[i]);
+        merged_pts_right.push_back(result_bc.pts_right_good[i]);
+        merged_kp_left.emplace_back(result_bc.pts_left_match[i], 1.0f);
+    }
+    // BC template corners scaled to class-0-ROI (already in BC's result)
+    for (int i = 0; i < n_bc_use && i < static_cast<int>(result_bc.pts_template_match.size()); ++i) {
+        merged_pts_template.push_back(result_bc.pts_template_match[i]);
+    }
+    // BC 3D points from AKAZE-template-derived corners
+    for (int i = 0; i < n_bc_use && i < static_cast<int>(dual_bc_tmpl_pts3d_.size()); ++i) {
+        merged_pts3d.push_back(dual_bc_tmpl_pts3d_[i]);
+    }
+
+    int bc_total = n_bc_use;
+    int bc_3d_added = std::min(n_bc_use, static_cast<int>(dual_bc_tmpl_pts3d_.size()));
+
+    // --- AK contribution (M matched feature points) ---
+    int m_ak = static_cast<int>(result_ak.pts_left_match.size());
+    const auto& ak_pts3d = dual_akaze_extractor_->templateData().pts_3d;
+
+    // For AK, pts_left_match has template match; try to find right-image match
+    // Use optical-flow-tracked pts_right_good that correspond to kp_left (with template match)
+    std::vector<int> ak_good_indices; // indices in kp_left that have both template AND stereo
+    if (!result_ak.good_matches.empty() && !result_ak.pts_left_good.empty()) {
+        // Build set of kp_left indices that passed optical flow
+        std::unordered_set<int> flow_indices;
+        for (int idx : result_ak.idx_from_filtered) {
+            flow_indices.insert(idx);
+        }
+        // Filter good_matches to those with stereo
+        for (const auto& m : result_ak.good_matches) {
+            if (flow_indices.count(m.queryIdx) > 0) {
+                ak_good_indices.push_back(static_cast<int>(m.queryIdx));
+            }
+        }
+    }
+
+    if (ak_good_indices.empty()) {
+        // Fallback: use pts_left_match as-is, skip right-image points for AK part
+        std::cout << "  [DualRoi] AK: no points with both stereo+template, using template-only"
+                  << std::endl;
+        for (int i = 0; i < m_ak; ++i) {
+            merged_pts_left.push_back(result_ak.pts_left_match[i]);
+            merged_kp_left.emplace_back(result_ak.pts_left_match[i], 1.0f);
+            // No right-image point available → use zero offset as placeholder
+            merged_pts_right.emplace_back(
+                result_ak.pts_left_match[i].x,
+                result_ak.pts_left_match[i].y);
+        }
+        // AK template match points (in template image coords)
+        for (int i = 0; i < m_ak && i < static_cast<int>(result_ak.pts_template_match.size()); ++i) {
+            merged_pts_template.push_back(result_ak.pts_template_match[i]);
+        }
+        // AK 3D points
+        for (int i = 0; i < m_ak && i < static_cast<int>(ak_pts3d.size()); ++i) {
+            merged_pts3d.push_back(ak_pts3d[i]);
+        }
+    } else {
+        // AK contribution: build lookup from kp_left index → stereo point index
+        std::unordered_map<int, int> kp_to_stereo; // kp_left idx → pts_left_good idx
+        for (int j = 0; j < static_cast<int>(result_ak.idx_from_filtered.size()); ++j) {
+            kp_to_stereo[result_ak.idx_from_filtered[j]] = j;
+        }
+
+        for (int i = 0; i < m_ak; ++i) {
+            int match_query = result_ak.good_matches[i].queryIdx; // kp_left index
+            merged_pts_left.push_back(result_ak.pts_left_match[i]);
+            merged_kp_left.emplace_back(result_ak.pts_left_match[i], 1.0f);
+
+            // Find stereo right point
+            auto it = kp_to_stereo.find(match_query);
+            if (it != kp_to_stereo.end() && it->second < static_cast<int>(result_ak.pts_right_good.size())) {
+                merged_pts_right.push_back(result_ak.pts_right_good[it->second]);
+            } else {
+                merged_pts_right.emplace_back(
+                    result_ak.pts_left_match[i].x,
+                    result_ak.pts_left_match[i].y);
+            }
+        }
+        // AK template + 3D points (by DMatch trainIdx)
+        for (int i = 0; i < m_ak; ++i) {
+            int train_idx = result_ak.good_matches[i].trainIdx;
+            if (i < static_cast<int>(result_ak.pts_template_match.size())) {
+                merged_pts_template.push_back(result_ak.pts_template_match[i]);
+            }
+            if (train_idx >= 0 && train_idx < static_cast<int>(ak_pts3d.size())) {
+                merged_pts3d.push_back(ak_pts3d[train_idx]);
+            }
+        }
+    }
+
+    int total_pts = static_cast<int>(merged_pts_left.size());
+    int total_right = static_cast<int>(merged_pts_right.size());
+    int total_3d = static_cast<int>(merged_pts3d.size());
+
+    // Sync counts: GPNP needs equal numbers
+    int total_use = std::min({total_pts, total_right, total_3d});
+    merged_pts_left.resize(total_use);
+    merged_pts_right.resize(total_use);
+    merged_pts3d.resize(total_use);
+    merged_kp_left.resize(total_use);
+
+    // Build 1:1 good_matches + idx_from_filtered
+    std::vector<cv::DMatch> merged_matches(total_use);
+    std::vector<int> merged_idx(total_use);
+    for (int i = 0; i < total_use; ++i) {
+        merged_matches[i] = cv::DMatch(i, i, 0.0f); // queryIdx=i → trainIdx=i
+        merged_idx[i] = i;
+    }
+
+    std::cout << "[DualRoi] Merged: " << total_use << " total (BC=" << bc_total
+              << " [3d=" << bc_3d_added << "], AK=" << m_ak_match << ")"
+              << "  pts3d=" << total_3d << std::endl;
+
+    if (total_use < 4) {
+        std::cerr << "[DualRoi] Too few merged points (" << total_use << "), aborting" << std::endl;
+        PipelineResult empty;
+        empty.is_first_frame = is_first;
+        empty.gpnp_success = false;
+        return empty;
+    }
+
+    // 7. Build PipelineResult
+    PipelineResult result;
+    result.kp_left         = std::move(merged_kp_left);
+    result.n_kp_left       = total_use;
+    result.pts_left_match  = merged_pts_left;
+    result.pts_left_good   = merged_pts_left;
+    result.pts_right_good  = merged_pts_right;
+    result.pts_left_used   = merged_pts_left;
+    result.pts_right_used  = merged_pts_right;
+    result.pts_template_match = merged_pts_template;
+    result.good_matches    = std::move(merged_matches);
+    result.idx_from_filtered = std::move(merged_idx);
+    result.left_color      = left_color_orig;
+    result.right_color     = right_color_orig;
+    result.is_first_frame  = is_first;
+
+    // Build valid_mask (all true, identity mapping)
+    result.valid_mask.resize(total_use, true);
+
+    // 8. Pose estimation
+    PoseEstimate pose;
+    double gpnp_timing = 0.0;
+    auto t_pnp_start = std::chrono::high_resolution_clock::now();
+
+    if (is_first && config_.use_initial_pnp) {
+        // First frame: InitialPnP → GPNP
+        MatchResult match_res;
+        match_res.good_matches       = result.good_matches;
+        match_res.pts_left_match     = result.pts_left_match;
+        match_res.pts_template_match = result.pts_template_match;
+
+        PoseEstimate init_pose = initial_pnp_.solve(match_res, merged_pts3d, camera_.K);
+        result.timing["initial_pnp"] = 0.0;
+
+        if (init_pose.success) {
+            std::cout << "  [DualRoi] InitialPnP OK, warm-starting GPNP" << std::endl;
+            pose = gpnp_solver_.solve(result, merged_pts3d, &init_pose.R, &init_pose.t, gpnp_timing);
+            if (!pose.success) {
+                std::cout << "  [DualRoi] GPNP failed, using InitialPnP result" << std::endl;
+                pose = init_pose;
+                pose.success = true;
+            }
+        } else {
+            std::cout << "  [DualRoi] InitialPnP failed, trying GPNP with default depth" << std::endl;
+            Eigen::Matrix3d R_id = Eigen::Matrix3d::Identity();
+            Eigen::Vector3d t_id(0, 0, 5000);
+            pose = gpnp_solver_.solve(result, merged_pts3d, &R_id, &t_id, gpnp_timing);
+        }
+    } else if (is_first && !config_.use_initial_pnp) {
+        std::cout << "  [DualRoi] InitialPnP skipped" << std::endl;
+        Eigen::Matrix3d R_id = Eigen::Matrix3d::Identity();
+        Eigen::Vector3d t_id(0, 0, 5000);
+        pose = gpnp_solver_.solve(result, merged_pts3d, &R_id, &t_id, gpnp_timing);
+    } else {
+        // Subsequent frame: warm-start from previous pose
+        const Eigen::Matrix3d* Rp = state_.has_cache ? &state_.R_prev : nullptr;
+        const Eigen::Vector3d* tp = state_.has_cache ? &state_.t_prev : nullptr;
+        pose = gpnp_solver_.solve(result, merged_pts3d, Rp, tp, gpnp_timing);
+    }
+
+    auto t_pnp_end = std::chrono::high_resolution_clock::now();
+    result.timing["gpnp"] = std::chrono::duration<double, std::milli>(t_pnp_end - t_pnp_start).count();
+
+    // 9. Restore full-image coordinates + finalize
+    cv::Point2d left_off(static_cast<double>(left_pri.x), static_cast<double>(left_pri.y));
+    cv::Point2d right_off(static_cast<double>(right_pri.x), static_cast<double>(right_pri.y));
+    offsetResultToOriginal(result, left_off, right_off, left_color_orig, right_color_orig);
+
+    if (pose.success) {
+        finalizePose(result, pose);
+    }
+
+    // ---- Visualization (dual-ROI) ----
+    if (visualize && pose.success) {
+        std::string prefix = "_f" + std::to_string(state_.frame_count);
+
+        const cv::Scalar BC_COLOR(0, 0, 255);    // red: BinaryCorner corners (class 0 edges)
+        const cv::Scalar AK_COLOR(0, 255, 0);    // green: AKAZE features (class 1 center)
+        int ak_count = total_use - bc_total;
+
+        auto projPoint = [&](const Eigen::Vector3d& P) -> cv::Point {
+            if (std::abs(P.z()) < 1e-6) return cv::Point(-1, -1);
+            Eigen::Vector2d uv = projectToImage(P, camera_.K);
+            return cv::Point(static_cast<int>(uv.x()), static_cast<int>(uv.y()));
+        };
+
+        // --- Panel 0: Overview — ROI rectangles on original image ---
+        {
+            cv::Mat p0 = left_color_orig.clone();
+            cv::rectangle(p0,
+                cv::Rect(left_pri.x, left_pri.y, left_pri.width, left_pri.height),
+                cv::Scalar(255, 0, 0), 2);
+            cv::rectangle(p0,
+                cv::Rect(left_sec.x, left_sec.y, left_sec.width, left_sec.height),
+                cv::Scalar(0, 255, 0), 2);
+            cv::putText(p0, "class0 (BC)",
+                cv::Point(left_pri.x + 4, left_pri.y + 14),
+                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 0, 0), 1);
+            cv::putText(p0, "class1 (AK)",
+                cv::Point(left_sec.x + 4, left_sec.y + 14),
+                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 0), 1);
+            cv::imwrite(output_dir_ + "/dual_roi_overview" + prefix + ".png", p0);
+        }
+
+        // --- Panel 1: Class 0 ROI zoomed — BC corners (red) + AK features (green) ---
+        {
+            cv::Mat p1 = left_color_orig(
+                cv::Rect(left_pri.x, left_pri.y, left_pri.width, left_pri.height)).clone();
+            float lx = static_cast<float>(left_off.x), ly = static_cast<float>(left_off.y);
+            for (int i = 0; i < total_use; ++i) {
+                cv::Point pt(static_cast<int>(result.pts_left_match[i].x - lx),
+                             static_cast<int>(result.pts_left_match[i].y - ly));
+                if (i < bc_total)
+                    cv::circle(p1, pt, 3, BC_COLOR, -1);
+                else
+                    cv::circle(p1, pt, 3, AK_COLOR, -1);
+            }
+            cv::imwrite(output_dir_ + "/dual_roi_corners" + prefix + ".png", p1);
+        }
+
+        // --- Panel 2: 3D axes on original image (origin = template center) ---
+        {
+            cv::Mat p2 = left_color_orig.clone();
+            double axis_len = 100.0;
+            double cx = config_.template_real_width_mm  / 2.0;  // template center X (mm)
+            double cy = config_.template_real_height_mm / 2.0;  // template center Y (mm)
+            Eigen::Vector3d o  = pose.R * Eigen::Vector3d(cx,        cy,        0) + pose.t;
+            Eigen::Vector3d ax = pose.R * Eigen::Vector3d(cx + axis_len, cy,     0) + pose.t;
+            Eigen::Vector3d ay = pose.R * Eigen::Vector3d(cx,       cy + axis_len, 0) + pose.t;
+            Eigen::Vector3d az = pose.R * Eigen::Vector3d(cx,       cy,        axis_len) + pose.t;
+            cv::line(p2, projPoint(o), projPoint(ax), cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+            cv::line(p2, projPoint(o), projPoint(ay), cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            cv::line(p2, projPoint(o), projPoint(az), cv::Scalar(255, 0, 0), 2, cv::LINE_AA);
+            cv::imwrite(output_dir_ + "/dual_roi_axes" + prefix + ".png", p2);
+        }
+
+        // --- Panel 3: Reprojection error on class 0 ROI zoomed ---
+        if (total_use > 0 && !merged_pts3d.empty()) {
+            cv::Mat p3 = left_color_orig(
+                cv::Rect(left_pri.x, left_pri.y, left_pri.width, left_pri.height)).clone();
+            float lx = static_cast<float>(left_off.x), ly = static_cast<float>(left_off.y);
+            for (int i = 0; i < total_use && i < static_cast<int>(merged_pts3d.size()); ++i) {
+                Eigen::Vector3d P_cam = pose.R * merged_pts3d[i] + pose.t;
+                Eigen::Vector2d uv = projectToImage(P_cam, camera_.K);
+                cv::Point pd(static_cast<int>(uv.x() - lx), static_cast<int>(uv.y() - ly));
+                cv::Point po(static_cast<int>(result.pts_left_match[i].x - lx),
+                             static_cast<int>(result.pts_left_match[i].y - ly));
+                cv::Scalar obs_color = (i < bc_total) ? BC_COLOR : AK_COLOR;
+                cv::circle(p3, pd, 2, cv::Scalar(0, 255, 0), -1);          // projected = green dot
+                cv::circle(p3, po, 4, obs_color, 1);                        // observed = color ring
+                cv::line(p3, pd, po, cv::Scalar(0, 255, 255), 1, cv::LINE_AA); // error = yellow
+            }
+            cv::imwrite(output_dir_ + "/dual_roi_reproj" + prefix + ".png", p3);
+        }
+
+        // --- Panel 4: Right-image class 0 ROI with matched corners ---
+        {
+            cv::Mat p4 = right_color_orig(
+                cv::Rect(right_pri.x, right_pri.y, right_pri.width, right_pri.height)).clone();
+            float rx = static_cast<float>(right_off.x), ry = static_cast<float>(right_off.y);
+            for (int i = 0; i < total_use; ++i) {
+                cv::Point pt(static_cast<int>(result.pts_right_good[i].x - rx),
+                             static_cast<int>(result.pts_right_good[i].y - ry));
+                if (i < bc_total)
+                    cv::circle(p4, pt, 3, BC_COLOR, -1);
+                else
+                    cv::circle(p4, pt, 3, AK_COLOR, -1);
+            }
+            cv::imwrite(output_dir_ + "/dual_roi_right" + prefix + ".png", p4);
+        }
+
+        // --- Panel 5: Image ↔ Template correspondence (side-by-side) ---
+        {
+            // Left: class-0-ROI image
+            cv::Mat p5_left = left_color_orig(
+                cv::Rect(left_pri.x, left_pri.y, left_pri.width, left_pri.height)).clone();
+
+            // Right: AKAZE template (grayscale → BGR, resize to match left height)
+            const cv::Mat& tmpl_gray = akaze_extractor_->templateData().gray_image;
+            cv::Mat tmpl_color;
+            if (!tmpl_gray.empty()) {
+                cv::cvtColor(tmpl_gray, tmpl_color, cv::COLOR_GRAY2BGR);
+            } else {
+                tmpl_color = cv::Mat(p5_left.rows, p5_left.rows, CV_8UC3,
+                                     cv::Scalar(128, 128, 128));
+            }
+            double scale_tmpl = static_cast<double>(p5_left.rows) / tmpl_color.rows;
+            cv::Mat tmpl_resized;
+            cv::resize(tmpl_color, tmpl_resized, cv::Size(), scale_tmpl, scale_tmpl,
+                      cv::INTER_NEAREST);
+
+            cv::Mat p5;
+            cv::hconcat(p5_left, tmpl_resized, p5);
+
+            float lx = static_cast<float>(left_off.x), ly = static_cast<float>(left_off.y);
+            int offset_x = p5_left.cols;  // horizontal boundary between image and template
+
+            for (int i = 0; i < total_use; ++i) {
+                // Image point (left side, class-0-ROI-local)
+                cv::Point pt_img(static_cast<int>(result.pts_left_match[i].x - lx),
+                                 static_cast<int>(result.pts_left_match[i].y - ly));
+
+                // Template point (right side, scaled to match display size)
+                cv::Point2f tmpl_pt;
+                if (i < bc_total && i < static_cast<int>(dual_bc_tmpl_corners_.size())) {
+                    tmpl_pt = dual_bc_tmpl_corners_[i] * scale_tmpl;
+                } else {
+                    int ak_idx = i - bc_total;
+                    if (ak_idx >= 0 && ak_idx < static_cast<int>(result_ak.pts_template_match.size()))
+                        tmpl_pt = result_ak.pts_template_match[ak_idx] * scale_tmpl;
+                    else
+                        continue;
+                }
+                cv::Point pt_tmpl(static_cast<int>(tmpl_pt.x) + offset_x,
+                                  static_cast<int>(tmpl_pt.y));
+
+                cv::Scalar color = (i < bc_total) ? BC_COLOR : AK_COLOR;
+                cv::circle(p5, pt_img,  2, color, -1);
+                cv::circle(p5, pt_tmpl, 2, color, -1);
+                cv::line(p5, pt_img, pt_tmpl, color, 1, cv::LINE_AA);
+            }
+            cv::imwrite(output_dir_ + "/dual_roi_correspondence" + prefix + ".png", p5);
+        }
+
+        std::cout << "  [DualRoi] Visualized: " << bc_total << " BC + "
+                  << ak_count << " AK corners" << std::endl;
+    }
+
+    result.n_matched = total_use;
+    result.n_projected = total_use;
+    addLogEntry(result, is_first, false);
+
+    std::cout << "[DualRoi] Frame done: n_pts=" << total_use
+              << "  GPNP=" << (pose.success ? "OK" : "FAIL")
+              << "  time=" << result.total_time_ms() << "ms"
+              << std::endl;
+
+    return result;
 }
 
 void StereoTracker::clearCache() { state_ = TrackingState{}; }

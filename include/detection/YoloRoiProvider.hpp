@@ -35,10 +35,11 @@ public:
     /// True if YOLO is ready for inference.
     bool isReady() const;
 
-    /// Run YOLO on both images, return dimension-matched stereo ROI pair.
+    /// Run YOLO on both images, return stereo RoiGroup pair.
+    /// Each RoiGroup may contain up to 2 ROIs (primary=class 0, secondary=class 1).
     /// Returns {invalid, invalid} if detection fails on either side.
-    std::pair<RoiRect, RoiRect> detect(const cv::Mat& left_img,
-                                        const cv::Mat& right_img);
+    std::pair<RoiGroup, RoiGroup> detect(const cv::Mat& left_img,
+                                          const cv::Mat& right_img);
 
 private:
     std::unique_ptr<YoloDetector> detector_;

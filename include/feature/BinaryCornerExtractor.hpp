@@ -116,10 +116,14 @@ public:
         double template_angle,
         const cv::Size& coord_size);
 
+    /// Geometric corner ordering: compute polar angles, start from reference, CCW.
+    static std::vector<int> reorderByGeometry(
+        const std::vector<cv::Point2f>& corners,
+        const cv::Point2f& center,
+        double reference_angle_deg,
+        double ref_dist = -1.0);
+
 private:
-    // ========================================================================
-    // Internal pipeline (operates on binary image, same as legacy)
-    // ========================================================================
 
     /// Core corner extraction from a binary image (0/255).
     /// @param binary_img      Otsu-binarized ROI
@@ -150,11 +154,6 @@ private:
         const std::vector<cv::Point2f>& binary_corners,
         double template_angle,
         const cv::Size& coord_size);
-    static std::vector<int> reorderByGeometry(
-        const std::vector<cv::Point2f>& corners,
-        const cv::Point2f& center,
-        double reference_angle_deg,
-        double ref_dist = -1.0);
 
     // Logging
     void logStep(const std::string& step, const std::string& info);

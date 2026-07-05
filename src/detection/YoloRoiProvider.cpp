@@ -34,8 +34,8 @@ bool YoloRoiProvider::isReady() const {
     return detector_ != nullptr && roi_gen_ != nullptr;
 }
 
-std::pair<RoiRect, RoiRect> YoloRoiProvider::detect(const cv::Mat& left_img,
-                                                     const cv::Mat& right_img) {
+std::pair<RoiGroup, RoiGroup> YoloRoiProvider::detect(const cv::Mat& left_img,
+                                                       const cv::Mat& right_img) {
     if (!isReady()) return {};
 
     std::vector<Detection> det_left, det_right;
@@ -51,15 +51,20 @@ std::pair<RoiRect, RoiRect> YoloRoiProvider::detect(const cv::Mat& left_img,
         return {};
     }
 
-    auto [rl, rr] = roi_gen_->generateStereo(
+    auto [lg, rg] = roi_gen_->generateStereoGroup(
         det_left, det_right, left_img.size(), right_img.size());
 
-    if (rl.valid() && rr.valid()) {
-        std::cout << "[YoloRoiProvider] ROI=(" << rl.x << "," << rl.y << ","
-                  << rl.width << "," << rl.height << ")" << std::endl;
+    if (lg.valid() && rg.valid()) {
+        std::cout << "[YoloRoiProvider] ROI=(" << lg.primary.x << "," << lg.primary.y << ","
+                  << lg.primary.width << "," << lg.primary.height << ")";
+        if (lg.is_dual) {
+            std::cout << " + secondary=(" << lg.secondary.x << "," << lg.secondary.y << ","
+                      << lg.secondary.width << "," << lg.secondary.height << ")";
+        }
+        std::cout << std::endl;
     }
 
-    return {rl, rr};
+    return {lg, rg};
 }
 
 } // namespace gpnp

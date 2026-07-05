@@ -81,6 +81,18 @@ int main(int argc, char** argv) {
     int akaze_min_area = fs["strategies"]["akaze_min_area"];
     int tiny_max_area  = fs["strategies"]["tiny_max_area"];
 
+    // 双 ROI 配置（class 1 ROI 拓展像素 + AKAZE 提取参数）
+    int dual_expand = 10;
+    double dual_akaze_scale = 0.5;
+    cv::FileNode dual_node = fs["strategies"]["dual_roi"];
+    if (!dual_node.empty()) {
+        dual_expand = dual_node["secondary_expand_pixels"];
+        cv::FileNode ak_node = dual_node["akaze"];
+        if (!ak_node.empty()) {
+            dual_akaze_scale = ak_node["scale"];
+        }
+    }
+
     // 输入输出
     std::string left_path  = fs["input"]["left"];
     std::string right_path = fs["input"]["right"];
@@ -131,7 +143,8 @@ int main(int argc, char** argv) {
     Eigen::Vector3d t_rl(baseline, 0.0, 0.0);
 
     TrackerConfig tracker_cfg = makeTrackerConfig(scale, min_pts, use_init_pnp, tw, th,
-                                                  akaze_min_area, tiny_max_area);
+                                                  akaze_min_area, tiny_max_area,
+                                                  dual_expand, dual_akaze_scale);
 
     try {
         // 加载双目图像
@@ -163,23 +176,28 @@ int main(int argc, char** argv) {
             std::cout << "\n===== 第 " << frame << " 帧 =====" << std::endl;
 
             // 获取 ROI：手动输入 > YOLO 检测
-            RoiRect rl, rr;
+            RoiGroup lg, rg;
             if (use_manual_roi) {
-                rl = manual_rl;
-                rr = manual_rr;
-                std::cout << "  手动 ROI: left=(" << rl.x << "," << rl.y << ","
-                          << rl.width << "," << rl.height << "), right=("
-                          << rr.x << "," << rr.y << "," << rr.width << "," << rr.height << ")" << std::endl;
+                lg = RoiGroup{manual_rl, {}, false};
+                rg = RoiGroup{manual_rr, {}, false};
+                std::cout << "  手动 ROI: left=(" << manual_rl.x << "," << manual_rl.y << ","
+                          << manual_rl.width << "," << manual_rl.height << "), right=("
+                          << manual_rr.x << "," << manual_rr.y << "," << manual_rr.width
+                          << "," << manual_rr.height << ")" << std::endl;
             } else if (yolo_ok) {
-                std::tie(rl, rr) = yolo.detect(left_img, right_img);
+                std::tie(lg, rg) = yolo.detect(left_img, right_img);
+                if (lg.is_dual) {
+                    std::cout << "  双 ROI 模式: secondary=(" << lg.secondary.width
+                              << "x" << lg.secondary.height << ")" << std::endl;
+                }
             }
 
             // process() 内部自动完成：策略链选择 + ROI padding + 提取 + 位姿解算
-            const RoiRect* pl = (rl.valid()) ? &rl : nullptr;
-            const RoiRect* pr = (rr.valid()) ? &rr : nullptr;
+            const RoiGroup* plg = lg.valid() ? &lg : nullptr;
+            const RoiGroup* prg = rg.valid() ? &rg : nullptr;
 
             // 处理当前帧
-            auto result = tracker.process(left_img, right_img, visualize, pl, pr);
+            auto result = tracker.process(left_img, right_img, visualize, plg, prg);
 
             // 输出结果摘要
             std::cout << "  特征点: " << result.n_kp_left

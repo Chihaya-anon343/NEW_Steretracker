@@ -54,6 +54,8 @@ struct TrackerConfig {
     LKParams lk_params;                  ///< Optical flow parameters
     int akaze_min_area{40000};           ///< Min ROI area to select AKAZE strategy
     int tiny_max_area{800};              ///< Max ROI area for TinyTarget strategy
+    int dual_roi_secondary_expand{10};   ///< Pixels to expand secondary (class 1) ROI in dual mode
+    double dual_roi_akaze_scale{0.5};    ///< AKAZE scale for dual-ROI class 1 extraction
 };
 
 // ============================================================================
@@ -296,6 +298,19 @@ struct RoiRect {
 
     /// Returns true if offset is zero (full-image mode, no ROI applied).
     bool isZero() const { return x == 0 && y == 0; }
+};
+
+/// ROI group: primary (class 0) + optional secondary (class 1, for large targets).
+struct RoiGroup {
+    RoiRect primary;        ///< Class 0 ROI (always used by existing strategies)
+    RoiRect secondary;      ///< Class 1 ROI (only valid when is_dual == true)
+    bool is_dual{false};    ///< True when secondary ROI is present and valid
+
+    /// Returns true if primary ROI is valid (minimum requirement).
+    bool valid() const { return primary.valid(); }
+
+    /// Returns true if neither primary nor secondary is valid.
+    bool empty() const { return !primary.valid() && !secondary.valid(); }
 };
 
 // ============================================================================
